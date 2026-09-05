@@ -23,8 +23,9 @@ tools/
   sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
   lint.js                     # 驗 SKILL frontmatter、registry、capabilities 引用
   projectors/                 # 每個 runtime 一支投影器
-    claude-code.js
-    codex.js
+    claude-code.js            # ~/.claude/skills、~/.claude.json mcpServers
+    codex.js                  # ~/.codex/skills、~/.codex/config.toml [mcp_servers]
+    antigravity.js            # ~/.gemini/antigravity-cli/skills、~/.gemini/config/mcp_config.json
 ```
 
 ## 用法

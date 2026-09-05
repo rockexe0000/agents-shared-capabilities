@@ -20,10 +20,15 @@ const HOME = process.env.HOME || os.homedir();
 const DRY = process.argv.includes('--dry-run');
 
 const SKILL_RUNTIMES = [
-  { id: 'claude-code', skillsDir: path.join(HOME, '.claude', 'skills') },
-  { id: 'codex', skillsDir: path.join(HOME, '.codex', 'skills') },
+  { id: 'claude-code', base: path.join(HOME, '.claude'), skillsDir: path.join(HOME, '.claude', 'skills') },
+  { id: 'codex', base: path.join(HOME, '.codex'), skillsDir: path.join(HOME, '.codex', 'skills') },
+  { id: 'antigravity', base: path.join(HOME, '.gemini'), skillsDir: path.join(HOME, '.gemini', 'antigravity-cli', 'skills') },
 ];
-const MCP_PROJECTORS = [require('./projectors/claude-code'), require('./projectors/codex')];
+const MCP_PROJECTORS = [
+  require('./projectors/claude-code'),
+  require('./projectors/codex'),
+  require('./projectors/antigravity'),
+];
 
 function skillSource(name, source) {
   if (source === 'catalog') return path.join(REPO, 'skills', name);
@@ -31,8 +36,9 @@ function skillSource(name, source) {
 }
 
 function linkSkill(rt, name, src) {
+  if (!fs.existsSync(rt.base)) return `skip (${rt.id} not installed)`;
+  if (!DRY) fs.mkdirSync(rt.skillsDir, { recursive: true });
   const dest = path.join(rt.skillsDir, name);
-  if (!fs.existsSync(rt.skillsDir)) return `skip (${rt.id} not installed)`;
   if (fs.existsSync(dest)) {
     const real = fs.lstatSync(dest).isSymbolicLink() ? fs.readlinkSync(dest) : null;
     if (real === src) return 'up-to-date';
