@@ -6,7 +6,18 @@
 const fs = require('fs');
 const path = require('path');
 
-const strip = (s) => (s == null ? s : String(s).trim().replace(/^["']|["']$/g, ''));
+// Drop a trailing ` # comment`, but not a `#` inside a quoted scalar.
+function stripComment(s) {
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") { q = c; continue; }
+    if (c === '#' && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) return s.slice(0, i);
+  }
+  return s;
+}
+const strip = (s) => (s == null ? s : stripComment(String(s)).trim().replace(/^["']|["']$/g, ''));
 
 /**
  * Parse mcp/registry.yaml -> [{name, transport, command, args, url, auth, env:{}}]
@@ -35,7 +46,7 @@ function parseRegistry(text) {
       continue;
     }
     section = null;
-    if (kv[1] === 'args') { try { cur.args = JSON.parse(kv[2]); } catch (_) { cur.args = []; } }
+    if (kv[1] === 'args') { try { cur.args = JSON.parse(stripComment(kv[2])); } catch (_) { cur.args = []; } }
     else cur[kv[1]] = strip(kv[2]);
   }
   return servers;
