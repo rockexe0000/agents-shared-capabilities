@@ -34,6 +34,10 @@ const MCP_PROJECTORS = [
 const FACADE_PROJECTOR = require('./projectors/oab-facade');
 const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless marked `route: direct`
 
+// --render <outdir> --capabilities <file>: emit config ARTIFACTS off-pod (for infra to
+// bake as a configMap) instead of projecting into a live HOME. Secrets stay ${env:} refs.
+if (process.argv.includes('--render')) { render(); process.exit(0); }
+
 function skillSource(name, source) {
   if (source === 'catalog') return path.join(REPO, 'skills', name);
   return null; // personal namespace (agent-bot/{uid}/skills) — TODO resolve
@@ -102,3 +106,33 @@ if (enable.mcp.length) {
 }
 
 console.log('\ndone' + (DRY ? ' (dry-run)' : ''));
+
+// ---- render mode (off-pod artifact generation; MCP only) ----
+function render() {
+  const argv = process.argv;
+  const outDir = argv[argv.indexOf('--render') + 1];
+  const ci = argv.indexOf('--capabilities');
+  const capFile = ci >= 0 ? argv[ci + 1] : path.join(HOME, 'personal', 'capabilities.md');
+  if (!outDir || outDir.startsWith('--')) {
+    console.error('usage: node sync.js --render <outdir> --capabilities <capabilities.md>');
+    process.exit(1);
+  }
+  const regFile = path.join(REPO, 'mcp', 'registry.yaml');
+  const registry = fs.existsSync(regFile) ? parseRegistry(fs.readFileSync(regFile, 'utf8')) : [];
+  const byName = new Map(registry.map((s) => [s.name, s]));
+  const enable = parseEnable(capFile);
+  const facade = [];
+  const direct = [];
+  for (const want of enable.mcp) {
+    const def = byName.get(want.name);
+    if (!def) { console.error(`  ${want.name}: not in registry — skipped`); continue; }
+    ((def.route || DEFAULT_ROUTE) === 'direct' ? direct : facade).push(def);
+  }
+  const shape = FACADE_PROJECTOR.shapeServer;
+  const asCfg = (list) => ({ mcpServers: Object.fromEntries(list.map((s) => [s.name, shape(s)])) });
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, 'openab-agent-mcp.json'), JSON.stringify(asCfg(facade), null, 2) + '\n');
+  fs.writeFileSync(path.join(outDir, 'runtime-mcp.json'), JSON.stringify(asCfg(direct), null, 2) + '\n');
+  console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
+  console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'}) → ${outDir}`);
+}
