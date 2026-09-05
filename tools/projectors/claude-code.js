@@ -27,7 +27,7 @@ function projectMcp(servers, home, opts = {}) {
   const updated = [];
   for (const s of servers) {
     const entry = s.transport === 'http'
-      ? { type: 'http', url: s.url }
+      ? Object.assign({ type: 'http', url: s.url }, Object.keys(s.headers || {}).length ? { headers: s.headers } : {})
       : { command: s.command, args: s.args || [], env: s.env || {} };
     cfg.mcpServers[s.name] = entry;
     updated.push(s.name);

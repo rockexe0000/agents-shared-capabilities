@@ -62,13 +62,13 @@ if (fs.existsSync(reg)) {
       if (names.has(v)) err(`mcp/registry.yaml:${i + 1}: duplicate server name '${v}'`);
       names.add(v);
     }
-    // secret hygiene: an env value that looks like a raw secret, not a reference
-    const ev = ln.match(/^\s{6,}[A-Z0-9_]+:\s*["']?([^"'#]+)/);
+    // secret hygiene: an env/header value that looks like a raw secret, not a reference
+    const ev = ln.match(/^\s{6,}[A-Za-z0-9_-]+:\s*["']?([^"'#]+)/);
     if (ev) {
       const val = ev[1].trim();
       const isRef = /^(env:|op:\/\/|vault:|\$\{)/.test(val);
-      if (!isRef && /(token|secret|key|password)/i.test(ln)) {
-        err(`mcp/registry.yaml:${i + 1}: env value looks like a raw secret; use a reference (env:/op://vault:)`);
+      if (!isRef && /(token|secret|key|password|authorization)/i.test(ln)) {
+        err(`mcp/registry.yaml:${i + 1}: value looks like a raw secret; use a reference (env:/op://vault:)`);
       }
     }
   });

@@ -23,13 +23,17 @@ function parseRegistry(text) {
     const indent = line.match(/^\s*/)[0].length;
     const t = line.trim();
     const item = t.match(/^-\s*name:\s*(.+)$/);
-    if (item && indent <= 2) { cur = { name: strip(item[1]), env: {} }; servers.push(cur); section = null; continue; }
+    if (item && indent <= 2) { cur = { name: strip(item[1]), env: {}, headers: {} }; servers.push(cur); section = null; continue; }
     if (!cur) continue;
     const opener = t.match(/^([\w-]+):\s*$/);
     if (opener && indent === 4) { section = opener[1]; continue; }
     const kv = t.match(/^([\w-]+):\s*(.*)$/);
     if (!kv) continue;
-    if (section && indent >= 6) { if (section === 'env') cur.env[kv[1]] = strip(kv[2]); continue; }
+    if (section && indent >= 6) {
+      if (section === 'env') cur.env[kv[1]] = strip(kv[2]);
+      else if (section === 'headers') cur.headers[kv[1]] = strip(kv[2]);
+      continue;
+    }
     section = null;
     if (kv[1] === 'args') { try { cur.args = JSON.parse(kv[2]); } catch (_) { cur.args = []; } }
     else cur[kv[1]] = strip(kv[2]);
@@ -91,7 +95,12 @@ function resolveRef(val, env) {
   return val.replace(/\$\{(\w+)\}/g, (_, v) => (env[v] != null ? env[v] : (process.env[v] != null ? process.env[v] : '')));
 }
 
-/** resolve a server's env map and args in place, returning {server, unresolved:[]} */
+/**
+ * Resolve a server's env, args, url, and headers. Returns {server, unresolved:[]}.
+ * headers are kept BOTH resolved (out.headers, for value-in projectors like
+ * claude-code/antigravity) and as env-var names (out.headerEnv, for codex
+ * env_http_headers which references the env var by name, keeping the secret out of file).
+ */
 function resolveServer(s, env) {
   const unresolved = [];
   const out = Object.assign({}, s);
@@ -105,6 +114,25 @@ function resolveServer(s, env) {
     const r = resolveRef(a, env);
     return r && r.unresolved ? a : r;
   });
+  if (s.url) {
+    for (const [, v] of [...s.url.matchAll(/\$\{(\w+)\}/g)]) {
+      if (env[v] == null && process.env[v] == null) unresolved.push(`${s.name}.url:${v}`);
+    }
+    out.url = s.url.replace(/\$\{(\w+)\}/g, (_, v) => (env[v] != null ? env[v] : (process.env[v] != null ? process.env[v] : `\${${v}}`)));
+  }
+  out.headers = {};
+  out.headerEnv = {};
+  for (const [k, v] of Object.entries(s.headers || {})) {
+    const m = typeof v === 'string' && v.match(/^env:(.+)$/);
+    if (m) {
+      out.headerEnv[k] = m[1];
+      const r = resolveRef(v, env);
+      if (r && r.unresolved) { unresolved.push(`${s.name}.headers.${k}=${r.unresolved}`); out.headers[k] = ''; }
+      else out.headers[k] = r;
+    } else {
+      out.headers[k] = v;
+    }
+  }
   return { server: out, unresolved };
 }
 

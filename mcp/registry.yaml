@@ -15,6 +15,26 @@ servers:
     source: "example (built-in)"
     pinned-ref: "n/a"
 
+  # ── OAB MCP Facade(loopback;search_capabilities / execute_capability)──
+  - name: oab
+    transport: http
+    url: "http://127.0.0.1:8848/mcp"
+    capability:
+      description: "OAB MCP Facade — 統一能力入口(loopback,信任邊界為 host/pod)"
+    source: "openabdev/openab:docs/oab-mcp-facade.md"
+    pinned-ref: "main"
+
+  # ── GitHub via octobroker gateway(per-agent policy;上游注入 pooled 憑證)──
+  - name: github
+    transport: http
+    url: "http://octobroker.${OCTOBROKER_NAMESPACE}:8080/mcp"
+    headers:
+      X-Octobroker-Key: "env:OCTOBROKER_KEY"
+    capability:
+      description: "GitHub 經 octobroker 閘道(agent 不持 GitHub 憑證;閘道注入)"
+    source: "openabdev/octobroker"
+    pinned-ref: "main"
+
   # ── 範例:remote http server(OAuth 由 runtime 本地處理)──────
   # - name: example-remote
   #   transport: http

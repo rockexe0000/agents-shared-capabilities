@@ -21,14 +21,20 @@ function toToml(servers) {
     out.push(`[mcp_servers.${s.name}]`);
     if (s.transport === 'http') {
       out.push(`url = ${q(s.url)}`);
+      // env_http_headers references env var by NAME (secret stays out of file);
+      // literal (non-env) headers go to http_headers.
+      const envH = Object.entries(s.headerEnv || {});
+      const litH = Object.entries(s.headers || {}).filter(([k]) => !(s.headerEnv && s.headerEnv[k]));
+      if (litH.length) out.push(`http_headers = { ${litH.map(([k, v]) => `${q(k)} = ${q(v)}`).join(', ')} }`);
+      if (envH.length) out.push(`env_http_headers = { ${envH.map(([k, v]) => `${q(k)} = ${q(v)}`).join(', ')} }`);
     } else {
       out.push(`command = ${q(s.command)}`);
       out.push(`args = [${(s.args || []).map(q).join(', ')}]`);
-    }
-    const env = Object.entries(s.env || {}).filter(([, v]) => v !== '');
-    if (env.length) {
-      out.push(`[mcp_servers.${s.name}.env]`);
-      for (const [k, v] of env) out.push(`${k} = ${q(v)}`);
+      const env = Object.entries(s.env || {}).filter(([, v]) => v !== '');
+      if (env.length) {
+        out.push(`[mcp_servers.${s.name}.env]`);
+        for (const [k, v] of env) out.push(`${k} = ${q(v)}`);
+      }
     }
     out.push('');
   }
