@@ -22,11 +22,19 @@ secrets/.env.example          # MCP 需要的環境變數「名稱」清單;真�
 tools/
   sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
   lint.js                     # 驗 SKILL frontmatter、registry、capabilities 引用
-  projectors/                 # 每個 runtime 一支投影器
-    claude-code.js            # ~/.claude/skills、~/.claude.json mcpServers
-    codex.js                  # ~/.codex/skills、~/.codex/config.toml [mcp_servers]
-    antigravity.js            # ~/.gemini/antigravity-cli/skills、~/.gemini/config/mcp_config.json
+  projectors/                 # 投影器
+    claude-code.js            # direct:~/.claude/skills、~/.claude.json mcpServers
+    codex.js                  # direct:~/.codex/skills、~/.codex/config.toml [mcp_servers]
+    antigravity.js            # direct:~/.gemini/antigravity-cli/skills、~/.gemini/config/mcp_config.json
+    oab-facade.js             # facade:~/.openab/agent/mcp.json(facade 背後的 source)
 ```
+
+## MCP route(預設 facade)
+
+registry 每個 server 標 `route`(預設 `facade`):
+
+- **facade**(預設):藏在 OAB MCP Facade 後面的 source(寫進 openab `~/.openab/agent/mcp.json`)。agent runtime **只連 loopback facade、不持任何 key**;secret 以 `${env:VAR}` 由 openab 解析。所有 Coding Agent 走同一個 facade endpoint,新增 MCP 設一次、全 runtime 共用。
+- **direct**:直接投影進各 runtime 的 MCP config。例外用途:① facade 本身(`oab-facade`)② 沒有 openab facade 的 host ③ facade 不能代理的 source。
 
 ## 用法
 

@@ -1,5 +1,7 @@
 # 一個 MCP server 定義的範本(貼進 mcp/registry.yaml 的 servers: 之下)
 - name: <server-name>
+  route: <facade | direct>   # 預設 facade(藏在 oab-facade 後;key 走 ${env:} 由 openab 解析)。
+                             # direct 僅用於:facade 本身、無 facade 的 host、facade 不能代理的 source。
   transport: <stdio | http>
   # stdio:
   command: <executable>

@@ -24,11 +24,15 @@ const SKILL_RUNTIMES = [
   { id: 'codex', base: path.join(HOME, '.codex'), skillsDir: path.join(HOME, '.codex', 'skills') },
   { id: 'antigravity', base: path.join(HOME, '.gemini'), skillsDir: path.join(HOME, '.gemini', 'antigravity-cli', 'skills') },
 ];
+// direct-route projectors: write the agent-facing runtime MCP config.
 const MCP_PROJECTORS = [
   require('./projectors/claude-code'),
   require('./projectors/codex'),
   require('./projectors/antigravity'),
 ];
+// facade-route projector: register sources behind the OAB MCP Facade (openab mcp.json).
+const FACADE_PROJECTOR = require('./projectors/oab-facade');
+const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless marked `route: direct`
 
 function skillSource(name, source) {
   if (source === 'catalog') return path.join(REPO, 'skills', name);
@@ -71,18 +75,29 @@ if (enable.mcp.length) {
   const registry = fs.existsSync(regFile) ? parseRegistry(fs.readFileSync(regFile, 'utf8')) : [];
   const byName = new Map(registry.map((s) => [s.name, s]));
   const env = loadDotenv(REPO);
-  const resolved = [];
+  const direct = [];   // resolved defs → runtime configs
+  const facade = [];   // raw defs → openab mcp.json (openab resolves ${env:} itself)
   for (const want of enable.mcp) {
     const def = byName.get(want.name);
     if (!def) { console.log(`  ${want.name}: ERROR not in registry`); continue; }
-    const { server, unresolved } = resolveServer(def, env);
-    if (unresolved.length) console.log(`  ${want.name}: WARN unresolved secret(s): ${unresolved.join(', ')}`);
-    resolved.push(server);
+    const route = def.route || DEFAULT_ROUTE;
+    if (route === 'direct') {
+      const { server, unresolved } = resolveServer(def, env);
+      if (unresolved.length) console.log(`  ${want.name} (direct): WARN unresolved secret(s): ${unresolved.join(', ')}`);
+      direct.push(server);
+    } else {
+      facade.push(def); // behind oab-facade; secrets stay as ${env:} refs
+      console.log(`  ${want.name}: route=facade (behind oab-facade)`);
+    }
   }
   for (const p of MCP_PROJECTORS) {
     if (!p.installed(HOME)) { console.log(`\n[${p.id} mcp] skip (not installed)`); continue; }
-    const r = p.projectMcp(resolved, HOME, { dry: DRY });
+    const r = p.projectMcp(direct, HOME, { dry: DRY });
     console.log(`\n[${p.id} mcp] ${DRY ? 'would update' : 'updated'} ${r.updated.join(', ') || '(none)'} → ${r.target}${DRY ? '' : ' (.bak saved)'}`);
+  }
+  if (facade.length) {
+    const r = FACADE_PROJECTOR.projectMcp(facade, HOME, { dry: DRY });
+    console.log(`\n[oab-facade sources] ${DRY ? 'would register' : 'registered'} ${r.updated.join(', ')} → ${r.target}${DRY ? '' : ' (.bak saved)'}`);
   }
 }
 

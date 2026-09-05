@@ -1,9 +1,16 @@
 # host-agnostic MCP server registry(集體 catalog)
 # 只放「定義」與 secret「參照」;真值不進 repo。個人專屬 server 放 agent-bot/{uid}/mcp/。
 # schema:見 templates/mcp-server.template.yaml;投影器見 tools/projectors/。
+#
+# route(政策:預設 facade):
+#   facade(預設)= 藏在 OAB MCP Facade 後面的 source(寫進 openab ~/.openab/agent/mcp.json);
+#                  agent runtime 只連 loopback facade、不持任何 key;secret 走 ${env:} 由 openab 解析。
+#   direct       = 直接投影進 runtime MCP config(~/.claude.json…)。例外用途:
+#                  ① facade 本身(oab-facade)② 沒有 openab facade 的 host ③ facade 不能代理的 source。
 servers:
   # ── 範例:stdio 本地 server ────────────────────────────────
   - name: example-fs
+    route: direct        # escape hatch: local stdio, no facade
     transport: stdio
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "${WORKSPACE_DIR}"]
@@ -17,6 +24,7 @@ servers:
 
   # ── OAB MCP Facade(loopback;search_capabilities / execute_capability)──
   - name: oab-facade
+    route: direct        # the facade itself — agent runtime connects here
     transport: http
     url: "http://127.0.0.1:8848/mcp"
     capability:
@@ -29,6 +37,7 @@ servers:
   # 需 agents-infra 於 octobroker-config.toml 開該 agent 的 MCP tools,並把
   # OCTOBROKER_KEY 注入 runtime 容器 env(見 ADR/handoff 的 agents-infra 調整)。
   - name: octobroker
+    route: facade        # hidden behind oab-facade (key stays facade-side)
     transport: http
     url: "http://127.0.0.1:8079/mcp"
     headers:
