@@ -21,6 +21,14 @@ function mapVals(obj) {
   return out;
 }
 
+// Build the openab mcp.json entry for a raw registry server (secrets → ${env:} refs).
+// Shared by the on-pod projector and the off-pod --render path so both agree.
+function shapeServer(s) {
+  return s.transport === 'http'
+    ? Object.assign({ type: 'http', url: s.url }, Object.keys(s.headers || {}).length ? { headers: mapVals(s.headers) } : {})
+    : { type: 'stdio', command: s.command, args: s.args || [], env: mapVals(s.env) };
+}
+
 /** @param {Array} servers RAW registry defs (unresolved) @returns {{updated:string[], target:string}} */
 function projectMcp(servers, home, opts = {}) {
   const file = target(home);
@@ -32,9 +40,7 @@ function projectMcp(servers, home, opts = {}) {
   cfg.mcpServers = cfg.mcpServers || {};
   const updated = [];
   for (const s of servers) {
-    cfg.mcpServers[s.name] = s.transport === 'http'
-      ? Object.assign({ type: 'http', url: s.url }, Object.keys(s.headers || {}).length ? { headers: mapVals(s.headers) } : {})
-      : { type: 'stdio', command: s.command, args: s.args || [], env: mapVals(s.env) };
+    cfg.mcpServers[s.name] = shapeServer(s);
     updated.push(s.name);
   }
   if (!opts.dry) {
@@ -44,4 +50,4 @@ function projectMcp(servers, home, opts = {}) {
   return { updated, target: file };
 }
 
-module.exports = { id: 'oab-facade', installed, projectMcp };
+module.exports = { id: 'oab-facade', installed, projectMcp, shapeServer };
