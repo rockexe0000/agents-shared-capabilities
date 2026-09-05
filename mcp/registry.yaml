@@ -16,7 +16,7 @@ servers:
     pinned-ref: "n/a"
 
   # ── OAB MCP Facade(loopback;search_capabilities / execute_capability)──
-  - name: oab
+  - name: oab-facade
     transport: http
     url: "http://127.0.0.1:8848/mcp"
     capability:
@@ -24,14 +24,17 @@ servers:
     source: "openabdev/openab:docs/oab-mcp-facade.md"
     pinned-ref: "main"
 
-  # ── GitHub via octobroker gateway(per-agent policy;上游注入 pooled 憑證)──
-  - name: github
+  # ── octobroker(pod-local sidecar,loopback:8079;agent 不持 GitHub 憑證)──
+  # sidecar 與 openab 同 pod;8079(8080 保留給 openab webhook)。
+  # 需 agents-infra 於 octobroker-config.toml 開該 agent 的 MCP tools,並把
+  # OCTOBROKER_KEY 注入 runtime 容器 env(見 ADR/handoff 的 agents-infra 調整)。
+  - name: octobroker
     transport: http
-    url: "http://octobroker.${OCTOBROKER_NAMESPACE}:8080/mcp"
+    url: "http://127.0.0.1:8079/mcp"
     headers:
       X-Octobroker-Key: "env:OCTOBROKER_KEY"
     capability:
-      description: "GitHub 經 octobroker 閘道(agent 不持 GitHub 憑證;閘道注入)"
+      description: "GitHub via octobroker pod-local sidecar(per-agent policy;閘道注入短期憑證)"
     source: "openabdev/octobroker"
     pinned-ref: "main"
 
