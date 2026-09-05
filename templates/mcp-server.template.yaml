@@ -1,0 +1,16 @@
+# 一個 MCP server 定義的範本(貼進 mcp/registry.yaml 的 servers: 之下)
+- name: <server-name>
+  transport: <stdio | http>
+  # stdio:
+  command: <executable>
+  args: ["<arg>", "..."]
+  # http:
+  # url: "https://..."
+  # auth: oauth            # token 交各 runtime 本地存,不入 registry
+  env:
+    # 值一律走參照,resolver 於本地取,永不寫真值:
+    SOME_TOKEN: "env:SOME_TOKEN"    # 或 op://vault/item/field、vault:path#key
+  capability:
+    description: "<這個 server 提供什麼>"
+  source: "<built-in | external:<repo/url>>"
+  pinned-ref: "<外部填 commit/tag;內建 n/a>"

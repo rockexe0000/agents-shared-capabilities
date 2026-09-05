@@ -1,0 +1,26 @@
+# host-agnostic MCP server registry(集體 catalog)
+# 只放「定義」與 secret「參照」;真值不進 repo。個人專屬 server 放 agent-bot/{uid}/mcp/。
+# schema:見 templates/mcp-server.template.yaml;投影器見 tools/projectors/。
+servers:
+  # ── 範例:stdio 本地 server ────────────────────────────────
+  - name: example-fs
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "${WORKSPACE_DIR}"]
+    env:
+      # 值走參照(resolver 於本地取),永不寫真值:
+      WORKSPACE_DIR: "env:WORKSPACE_DIR"
+    capability:
+      description: "read-only 檔案存取範例"
+    source: "example (built-in)"
+    pinned-ref: "n/a"
+
+  # ── 範例:remote http server(OAuth 由 runtime 本地處理)──────
+  # - name: example-remote
+  #   transport: http
+  #   url: "https://mcp.example.com"
+  #   auth: oauth        # token 交各 runtime 本地存,不入 registry
+  #   capability:
+  #     description: "範例遠端 server"
+  #   source: "external:example.com"
+  #   pinned-ref: "2026-09-04"
