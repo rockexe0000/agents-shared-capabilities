@@ -38,6 +38,18 @@ registry 每個 server 標 `route`(預設 `facade`):
 
 ## 用法
 
+### 一鍵 bootstrap(建議)
+
+冪等接入:clone/pull 三正本 → 佈 `~/` symlink → 首次從範本生 `capabilities.md` → sync → 印 reload 提示。可安全重跑(不覆蓋既有 `capabilities.md`)。
+
+```sh
+AGENT_UID=<uid> ~/.agents-shared-capabilities/bootstrap.sh
+```
+
+repo URL / checkout 路徑 / `NO_SYNC` / `NO_PULL` 皆可用 env 覆蓋(見 `bootstrap.sh` 檔頭)。維運面用 OpenAB config cron 週期跑 `sync` + `lint` 做漂移檢查。
+
+### 手動分解
+
 ```sh
 # 1. clone 到固定位置
 git clone https://github.com/rockexe0000/agents-shared-capabilities ~/.agents-shared-capabilities
