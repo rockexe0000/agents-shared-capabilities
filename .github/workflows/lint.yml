@@ -1,0 +1,20 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Catalog tooling is dependency-free — no install step needed.
+      - name: Lint capability catalog
+        run: node tools/lint.js
+      - name: Sync smoke (dry-run, empty HOME)
+        run: HOME="$(mktemp -d)" node tools/sync.js --dry-run
