@@ -39,6 +39,7 @@ const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless ma
 // --render <outdir> --capabilities <file>: emit config ARTIFACTS off-pod (for infra to
 // bake as a configMap) instead of projecting into a live HOME. Secrets stay ${env:} refs.
 if (process.argv.includes('--render')) { render(); process.exit(0); }
+if (process.argv.includes('--check')) { check(); /* check() exits */ }
 
 // Resolve the agent's cold namespace base (agent-bot/{uid}) from ~/personal, which
 // is symlinked to agent-bot/{uid}/personal. Its parent dir holds the sibling
@@ -131,16 +132,15 @@ if (enable.mcp.length) {
 
 console.log('\ndone' + (DRY ? ' (dry-run)' : ''));
 
-// ---- render mode (off-pod artifact generation; MCP only) ----
-function render() {
-  const argv = process.argv;
-  const outDir = argv[argv.indexOf('--render') + 1];
-  const ci = argv.indexOf('--capabilities');
-  const capFile = ci >= 0 ? argv[ci + 1] : path.join(HOME, 'personal', 'capabilities.md');
-  if (!outDir || outDir.startsWith('--')) {
-    console.error('usage: node sync.js --render <outdir> --capabilities <capabilities.md>');
-    process.exit(1);
-  }
+// ---- render / check (off-pod artifact generation; MCP only) ----
+function capFileArg() {
+  const ci = process.argv.indexOf('--capabilities');
+  return ci >= 0 ? process.argv[ci + 1] : path.join(HOME, 'personal', 'capabilities.md');
+}
+
+// Build the two rendered artifacts (as pretty JSON text) from a capabilities.md.
+// Shared by --render (write) and --check (compare) so both see identical output.
+function buildArtifacts(capFile) {
   // personal base from the capabilities file: agent-bot/{uid}/personal/capabilities.md → agent-bot/{uid}
   let base = null;
   try { base = path.dirname(path.dirname(fs.realpathSync(capFile))); } catch (_) {}
@@ -154,10 +154,54 @@ function render() {
     ((def.route || DEFAULT_ROUTE) === 'direct' ? direct : facade).push(def);
   }
   const shape = FACADE_PROJECTOR.shapeServer;
-  const asCfg = (list) => ({ mcpServers: Object.fromEntries(list.map((s) => [s.name, shape(s)])) });
+  const asCfg = (list) => JSON.stringify({ mcpServers: Object.fromEntries(list.map((s) => [s.name, shape(s)])) }, null, 2) + '\n';
+  return {
+    facade, direct,
+    files: { 'openab-agent-mcp.json': asCfg(facade), 'runtime-mcp.json': asCfg(direct) },
+  };
+}
+
+function render() {
+  const outDir = process.argv[process.argv.indexOf('--render') + 1];
+  if (!outDir || outDir.startsWith('--')) {
+    console.error('usage: node sync.js --render <outdir> [--capabilities <capabilities.md>]');
+    process.exit(1);
+  }
+  const capFile = capFileArg();
+  const { facade, direct, files } = buildArtifacts(capFile);
   fs.mkdirSync(outDir, { recursive: true });
-  fs.writeFileSync(path.join(outDir, 'openab-agent-mcp.json'), JSON.stringify(asCfg(facade), null, 2) + '\n');
-  fs.writeFileSync(path.join(outDir, 'runtime-mcp.json'), JSON.stringify(asCfg(direct), null, 2) + '\n');
+  for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(outDir, name), text);
   console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
   console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'}) → ${outDir}`);
+}
+
+// Drift check: re-render from the catalog + capabilities.md and compare against the
+// committed artifacts in <committedDir> (option-C GitOps: infra bakes them as a
+// configMap). Exits 1 on drift so CI / a cron can fail loudly. Deterministic, no HOME.
+function check() {
+  const dir = process.argv[process.argv.indexOf('--check') + 1];
+  if (!dir || dir.startsWith('--')) {
+    console.error('usage: node sync.js --check <committed-artifacts-dir> [--capabilities <capabilities.md>]');
+    process.exit(1);
+  }
+  const { files } = buildArtifacts(capFileArg());
+  let drift = false;
+  for (const [name, want] of Object.entries(files)) {
+    const committed = path.join(dir, name);
+    const have = fs.existsSync(committed) ? fs.readFileSync(committed, 'utf8') : null;
+    if (have === want) { console.log(`  ${name}: IN SYNC`); continue; }
+    drift = true;
+    if (have === null) { console.error(`  ${name}: DRIFT — missing in ${dir}`); continue; }
+    console.error(`  ${name}: DRIFT — committed differs from freshly rendered`);
+    // minimal line-level hint
+    const w = want.split('\n'), h = have.split('\n');
+    for (let i = 0; i < Math.max(w.length, h.length); i++) {
+      if (w[i] !== h[i]) {
+        if (h[i] !== undefined) console.error(`      - committed: ${h[i]}`);
+        if (w[i] !== undefined) console.error(`      + rendered:  ${w[i]}`);
+      }
+    }
+  }
+  console.log(drift ? '\ndrift detected — re-render and commit the artifacts' : '\nno drift — committed artifacts are current');
+  process.exit(drift ? 1 : 0);
 }

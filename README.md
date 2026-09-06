@@ -59,3 +59,13 @@ Codex 需重啟才吃到新 skill;Claude Code 下次啟動載入。
 
 - **憑證不進 repo**:registry 只放 secret 參照(`env:` / `op://` / `vault:`),真值由 resolver 於本地取;OAuth token 交各 runtime 本地存。
 - **外部能力**:先審 + 釘版本 + vendored(PR merge = review),不 live-link 遠端 marketplace。
+
+## 漂移檢查(drift check)
+
+option-C(render → configMap)下,pod 上沒有 repo checkout,漂移風險是**已 commit 的 render 產物** vs **catalog + 該 agent `capabilities.md`** 走鐘。`--check` 是確定性比對:重跑 render 與指定目錄的已 commit 產物比較,漂移則 exit 1(供 CI 或維運 cron fail loud)。
+
+```sh
+node tools/sync.js --check <committed-artifacts-dir> --capabilities <capabilities.md>
+```
+
+例:CI 於 agents-infra checkout 本 repo + cold repo,對每個 agent overlay 跑 `--check overlays/<agent> --capabilities <cold>/agent-bot/<agent>/personal/capabilities.md`。
