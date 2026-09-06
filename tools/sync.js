@@ -23,12 +23,14 @@ const SKILL_RUNTIMES = [
   { id: 'claude-code', base: path.join(HOME, '.claude'), skillsDir: path.join(HOME, '.claude', 'skills') },
   { id: 'codex', base: path.join(HOME, '.codex'), skillsDir: path.join(HOME, '.codex', 'skills') },
   { id: 'antigravity', base: path.join(HOME, '.gemini'), skillsDir: path.join(HOME, '.gemini', 'antigravity-cli', 'skills') },
+  { id: 'opencode', base: path.join(HOME, '.config', 'opencode'), skillsDir: path.join(HOME, '.config', 'opencode', 'skills') },
 ];
 // direct-route projectors: write the agent-facing runtime MCP config.
 const MCP_PROJECTORS = [
   require('./projectors/claude-code'),
   require('./projectors/codex'),
   require('./projectors/antigravity'),
+  require('./projectors/opencode'),
 ];
 // facade-route projector: register sources behind the OAB MCP Facade (openab mcp.json).
 const FACADE_PROJECTOR = require('./projectors/oab-facade');
