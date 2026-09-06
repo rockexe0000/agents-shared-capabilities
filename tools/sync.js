@@ -38,9 +38,31 @@ const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless ma
 // bake as a configMap) instead of projecting into a live HOME. Secrets stay ${env:} refs.
 if (process.argv.includes('--render')) { render(); process.exit(0); }
 
-function skillSource(name, source) {
+// Resolve the agent's cold namespace base (agent-bot/{uid}) from ~/personal, which
+// is symlinked to agent-bot/{uid}/personal. Its parent dir holds the sibling
+// skills/ and mcp/ personal namespaces (ADR 0002 Decision 3). null if not mounted.
+function personalBase() {
+  try {
+    const real = fs.realpathSync(path.join(HOME, 'personal')); // …/agent-bot/{uid}/personal
+    return path.dirname(real);                                 // …/agent-bot/{uid}
+  } catch (_) {
+    return null;
+  }
+}
+
+// Load catalog + personal MCP registries into one name→def map; personal overrides
+// catalog on name collision (ADR 0002 Decision 3: 個人覆蓋 catalog).
+function buildRegistry(base) {
+  const load = (f) => (fs.existsSync(f) ? parseRegistry(fs.readFileSync(f, 'utf8')) : []);
+  const byName = new Map(load(path.join(REPO, 'mcp', 'registry.yaml')).map((s) => [s.name, s]));
+  if (base) for (const s of load(path.join(base, 'mcp', 'registry.yaml'))) byName.set(s.name, s);
+  return byName;
+}
+
+function skillSource(name, source, base) {
   if (source === 'catalog') return path.join(REPO, 'skills', name);
-  return null; // personal namespace (agent-bot/{uid}/skills) — TODO resolve
+  if (source === 'personal') return base ? path.join(base, 'skills', name) : null;
+  return null;
 }
 
 function linkSkill(rt, name, src) {
@@ -59,14 +81,16 @@ function linkSkill(rt, name, src) {
 }
 
 const enable = parseEnable(path.join(HOME, 'personal', 'capabilities.md'));
+const PBASE = personalBase();
+console.log(`personal namespace: ${PBASE || '(unresolved — ~/personal not a symlink into agent-bot/{uid})'}`);
 
 // ---- skills ----
 console.log(`enabled skills: ${enable.skills.map((s) => s.name).join(', ') || '(none)'}`);
 for (const rt of SKILL_RUNTIMES) {
   console.log(`\n[${rt.id} skills]`);
   for (const s of enable.skills) {
-    const src = skillSource(s.name, s.source);
-    if (!src) { console.log(`  ${s.name}: TODO resolve personal namespace (agent-bot/{uid}/skills)`); continue; }
+    const src = skillSource(s.name, s.source, PBASE);
+    if (!src) { console.log(`  ${s.name}: ERROR cannot resolve source=${s.source} (personal namespace not mounted)`); continue; }
     if (!fs.existsSync(src)) { console.log(`  ${s.name}: ERROR source missing (${src})`); continue; }
     console.log(`  ${s.name}: ${linkSkill(rt, s.name, src)}`);
   }
@@ -75,9 +99,7 @@ for (const rt of SKILL_RUNTIMES) {
 // ---- MCP ----
 console.log(`\nenabled MCP servers: ${enable.mcp.map((s) => s.name).join(', ') || '(none)'}`);
 if (enable.mcp.length) {
-  const regFile = path.join(REPO, 'mcp', 'registry.yaml');
-  const registry = fs.existsSync(regFile) ? parseRegistry(fs.readFileSync(regFile, 'utf8')) : [];
-  const byName = new Map(registry.map((s) => [s.name, s]));
+  const byName = buildRegistry(PBASE);
   const env = loadDotenv(REPO);
   const direct = [];   // resolved defs → runtime configs
   const facade = [];   // raw defs → openab mcp.json (openab resolves ${env:} itself)
@@ -117,9 +139,10 @@ function render() {
     console.error('usage: node sync.js --render <outdir> --capabilities <capabilities.md>');
     process.exit(1);
   }
-  const regFile = path.join(REPO, 'mcp', 'registry.yaml');
-  const registry = fs.existsSync(regFile) ? parseRegistry(fs.readFileSync(regFile, 'utf8')) : [];
-  const byName = new Map(registry.map((s) => [s.name, s]));
+  // personal base from the capabilities file: agent-bot/{uid}/personal/capabilities.md → agent-bot/{uid}
+  let base = null;
+  try { base = path.dirname(path.dirname(fs.realpathSync(capFile))); } catch (_) {}
+  const byName = buildRegistry(base);
   const enable = parseEnable(capFile);
   const facade = [];
   const direct = [];
