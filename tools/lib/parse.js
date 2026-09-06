@@ -5,6 +5,53 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
+
+// Run a resolver CLI without a shell (execFile — no injection from the ref).
+// Returns trimmed stdout, or null if the binary is missing / exits non-zero.
+function runCli(bin, args) {
+  try {
+    return execFileSync(bin, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Pluggable secret backends (ADR 0002 Decision 7). registry only stores refs;
+ * the real value is fetched here at sync/render time. Each returns the value or
+ * { unresolved } so callers keep the ref and warn (never bakes a raw secret).
+ *   op://vault/item/field        → 1Password CLI:  op read <ref>
+ *   vault:<path>#<field>         → HashiCorp Vault: vault kv get -field=<field> <path>
+ *   keychain:<service>[/<acct>]  → macOS Keychain:  security find-generic-password …
+ */
+const BACKENDS = {
+  op(ref) {
+    const v = runCli('op', ['read', ref]);
+    return v != null ? v : { unresolved: ref };
+  },
+  vault(ref) {
+    const body = ref.replace(/^vault:/, '');
+    const hash = body.lastIndexOf('#');
+    if (hash < 0) return { unresolved: ref }; // need a #field selector
+    const secretPath = body.slice(0, hash);
+    const field = body.slice(hash + 1);
+    if (!secretPath || !field) return { unresolved: ref };
+    const v = runCli('vault', ['kv', 'get', '-field=' + field, secretPath]);
+    return v != null ? v : { unresolved: ref };
+  },
+  keychain(ref) {
+    const body = ref.replace(/^keychain:/, '');
+    const slash = body.indexOf('/');
+    const service = slash < 0 ? body : body.slice(0, slash);
+    const account = slash < 0 ? null : body.slice(slash + 1);
+    if (!service) return { unresolved: ref };
+    const args = ['find-generic-password', '-s', service, '-w'];
+    if (account) args.splice(3, 0, '-a', account);
+    const v = runCli('security', args);
+    return v != null ? v : { unresolved: ref };
+  },
+};
 
 // Drop a trailing ` # comment`, but not a `#` inside a quoted scalar.
 function stripComment(s) {
@@ -95,12 +142,16 @@ function loadDotenv(repo) {
 }
 
 /**
- * Resolve a secret reference. env: and ${VAR} resolve from dotenv/process.env.
- * op:// and vault: are left unresolved (resolver not yet implemented) -> {unresolved}.
+ * Resolve a secret reference. env: and ${VAR} resolve from dotenv/process.env;
+ * op:// / vault: / keychain: go through their pluggable BACKENDS. Anything that
+ * can't be resolved (missing CLI, bad ref, non-zero exit) returns {unresolved}
+ * so the caller keeps the ref and warns — a raw secret is never baked in.
  */
 function resolveRef(val, env) {
   if (typeof val !== 'string') return val;
-  if (/^(op:\/\/|vault:)/.test(val)) return { unresolved: val };
+  if (/^op:\/\//.test(val)) return BACKENDS.op(val);
+  if (/^vault:/.test(val)) return BACKENDS.vault(val);
+  if (/^keychain:/.test(val)) return BACKENDS.keychain(val);
   const m = val.match(/^env:(.+)$/);
   if (m) return env[m[1]] != null ? env[m[1]] : (process.env[m[1]] != null ? process.env[m[1]] : { unresolved: val });
   return val.replace(/\$\{(\w+)\}/g, (_, v) => (env[v] != null ? env[v] : (process.env[v] != null ? process.env[v] : '')));
