@@ -1,0 +1,33 @@
+# host-agnostic hook registry(集體 catalog)—— capability 第三軸(ADR 0005)
+# 只放「定義」;secret 走參照,不進 repo。個人專屬 hook 放 agent-bot/{uid}/hooks/。
+# schema/範本:templates/hook.template.yaml;投影器:tools/projectors/。
+#
+# 授權(ADR 0005 D3):hook 由 harness 自動執行、繞過 Permission Boundary,故無 ask,
+#   只有 allow/deny —— 授權前移到「是否 enable」這一步,寫在 ~/personal/capabilities.md
+#   的 hooks: effect(預設 deny/全關)。catalog PR = review 閘;外部 hook 需釘版本 + checksum。
+#
+# event(canonical,極小字彙):pre-tool | post-tool | session-start | stop | user-prompt-submit
+#   各 projector 把 canonical 映射到 host 原生事件;對應不到的 runtime → skip + log。
+#   matcher(選配,pre-tool/post-tool 用):host-native tool-name 比對(如 "Edit|Write")。
+hooks:
+  # ── 範例:內部(catalog)hook —— 每次 Edit/Write 後跑一個 no-op 標記 ──
+  - name: post-edit-noop
+    event: post-tool
+    matcher: "Edit|Write"
+    command: "true"
+    capability:
+      description: "範例 post-tool hook(no-op);示範 catalog → runtime 投影"
+    source: "example (built-in)"
+    pinned-ref: "n/a"
+    checksum: "n/a"
+
+  # ── 範例:外部 hook —— 需 vendored + 釘版本 + checksum(ADR 0002 D6 / 0005 D4)──
+  # - name: gitleaks-pre-commit
+  #   event: pre-tool
+  #   matcher: "Bash"
+  #   command: "~/.agents-shared-capabilities/hooks/vendored/gitleaks-guard.sh"
+  #   capability:
+  #     description: "pre-tool 阻擋含 secret 的 shell(外部,vendored)"
+  #   source: "external:github.com/example/gitleaks-guard"
+  #   pinned-ref: "v1.2.0"
+  #   checksum: "sha256:<vendored script 的 sha256>"

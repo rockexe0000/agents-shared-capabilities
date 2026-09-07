@@ -1,0 +1,11 @@
+# hook 定義範本(ADR 0005)—— 複製一段到 hooks/registry.yaml 的 `hooks:` 底下。
+# host-agnostic:只寫 canonical event,各 projector 映射到 host 原生事件。
+- name: my-hook                     # kebab-case,≤64;= capabilities.md hooks: 引用的名字
+  event: post-tool                  # canonical:pre-tool | post-tool | session-start | stop | user-prompt-submit
+  matcher: "Edit|Write"             # 選配(pre-tool/post-tool 用):host-native tool-name 比對
+  command: "your-command --here"    # 事件觸發時執行的 shell(auto-exec,無 runtime 授權閘)
+  capability:
+    description: "一句話說明這個 hook 做什麼"
+  source: "example (built-in)"      # 內部寫 built-in;外部寫 external:<repo/url>
+  pinned-ref: "n/a"                 # 外部 hook 必填真值(釘版本/commit);內部 n/a
+  checksum: "n/a"                   # 外部 hook 必填 vendored script 的 sha256;內部 n/a

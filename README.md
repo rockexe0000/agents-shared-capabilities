@@ -12,18 +12,21 @@
 
 兩軸正交、疊加生效。載入過濾 ≠ shell 授權邊界。
 
+**hook 是例外(第三軸,ADR 0005):** hook 由 harness 在事件上**自動執行**,不經 agent 的 tool call,**閘 2 對 hook 不 fire**。因此 hook 沒有三態 `ask`(fire 當下無互動點),只有 **allow / deny**——授權前移到「是否 enable」:寫在 `~/personal/capabilities.md` 的 `hooks: effect`(預設全關)。catalog PR = review 閘;外部 hook 需 vendored + 釘版本 + checksum。canonical 事件:`pre-tool | post-tool | session-start | stop | user-prompt-submit`,各 projector 映射到 host 原生,對應不到就 skip。
+
 ## Layout
 
 ```
 skills/<name>/SKILL.md        # 集體 skill(frontmatter name+description;可帶 references/ scripts/ assets/)
 mcp/registry.yaml             # host-agnostic MCP server 定義(secret 只放參照)
-templates/                    # SKILL / mcp-server / capabilities 範本
+hooks/registry.yaml           # host-agnostic hook 定義(canonical event + command;ADR 0005)
+templates/                    # SKILL / mcp-server / hook / capabilities 範本
 secrets/.env.example          # MCP 需要的環境變數「名稱」清單;真值放本地 secrets/.env(gitignore)
 tools/
   sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
   lint.js                     # 驗 SKILL frontmatter、registry、capabilities 引用
   projectors/                 # 投影器
-    claude-code.js            # direct:~/.claude/skills、~/.claude.json mcpServers
+    claude-code.js            # direct:~/.claude/skills、~/.claude.json mcpServers、~/.claude/settings.json hooks
     codex.js                  # direct:~/.codex/skills、~/.codex/config.toml [mcp_servers]
     antigravity.js            # direct:~/.gemini/antigravity-cli/skills、~/.gemini/config/mcp_config.json
     oab-facade.js             # facade:~/.openab/agent/mcp.json(facade 背後的 source)
