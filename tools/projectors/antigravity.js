@@ -13,6 +13,56 @@ const path = require('path');
 function target(home) { return path.join(home, '.gemini', 'config', 'mcp_config.json'); }
 function installed(home) { return fs.existsSync(path.join(home, '.gemini')); }
 
+// ---- hooks (ADR 0005) ----
+// Antigravity hooks.json is keyed by an arbitrary hook NAME → { <Event>: [groups] }.
+// We namespace our keys with a prefix so add/remove is by-key (like MCP by name),
+// never touching user-authored hook names. Antigravity has no session-start /
+// user-prompt-submit equivalent → those canonical events are unmapped (skip+log).
+function hookTarget(home) { return path.join(home, '.gemini', 'config', 'hooks.json'); }
+const MANAGED_PREFIX = 'asc:'; // agents-shared-capabilities-owned hook-name keys
+const HOOK_EVENT = {
+  'pre-tool': 'PreToolUse',
+  'post-tool': 'PostToolUse',
+  'stop': 'Stop',
+};
+
+/**
+ * Project enabled hooks into ~/.gemini/config/hooks.json. Idempotent: drops every
+ * top-level key we own (`asc:` prefix) then re-adds the enabled set, so a disabled
+ * hook disappears and user-authored hooks (any other key) are never touched.
+ * Unmappable canonical events (session-start / user-prompt-submit) are skipped+logged.
+ * @param {Array} hooks resolved hook defs [{name,event,matcher,command}]
+ * @returns {{updated:string[], skipped:Array<{name:string,event:string}>, target:string}}
+ */
+function projectHooks(hooks, home, opts = {}) {
+  const file = hookTarget(home);
+  const exists = fs.existsSync(file);
+  if (!exists && hooks.length === 0) return { updated: [], skipped: [], target: file };
+  let cfg = {};
+  if (exists) {
+    cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!opts.dry) fs.copyFileSync(file, file + '.bak');
+  }
+  // 1. strip our previously-managed keys
+  for (const key of Object.keys(cfg)) if (key.startsWith(MANAGED_PREFIX)) delete cfg[key];
+  // 2. add currently-enabled hooks
+  const updated = [];
+  const skipped = [];
+  for (const h of hooks) {
+    const native = HOOK_EVENT[h.event];
+    if (!native) { skipped.push({ name: h.name, event: h.event }); continue; }
+    const entry = { type: 'command', command: h.command };
+    const group = h.matcher ? { matcher: h.matcher, hooks: [entry] } : { hooks: [entry] };
+    cfg[MANAGED_PREFIX + h.name] = { [native]: [group] };
+    updated.push(h.name);
+  }
+  if (!opts.dry) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n');
+  }
+  return { updated, skipped, target: file };
+}
+
 /** @returns {{updated:string[], target:string}} */
 function projectMcp(servers, home, opts = {}) {
   const file = target(home);
@@ -36,4 +86,4 @@ function projectMcp(servers, home, opts = {}) {
   return { updated, target: file };
 }
 
-module.exports = { id: 'antigravity', installed, projectMcp };
+module.exports = { id: 'antigravity', installed, projectMcp, projectHooks };
