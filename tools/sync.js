@@ -34,8 +34,8 @@ const MCP_PROJECTORS = [
 ];
 // facade-route projector: register sources behind the OAB MCP Facade (openab mcp.json).
 const FACADE_PROJECTOR = require('./projectors/oab-facade');
-// hook projectors (ADR 0005). MVP: claude-code only; others join as they gain projectHooks.
-const HOOK_PROJECTORS = [require('./projectors/claude-code')];
+// hook projectors (ADR 0005). claude-code + antigravity; others join as they gain projectHooks.
+const HOOK_PROJECTORS = [require('./projectors/claude-code'), require('./projectors/antigravity')];
 const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless marked `route: direct`
 
 // --render <outdir> --capabilities <file>: emit config ARTIFACTS off-pod (for infra to
