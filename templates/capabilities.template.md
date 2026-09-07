@@ -20,3 +20,8 @@ skills:
 
 mcp:
   servers: []              # 例:- { name: example-fs, tools: ["*"] }
+
+hooks:
+  # 例:- { name: post-edit-noop, effect: allow }
+  # hook 由 harness 自動執行、繞過 Permission Boundary → 只有 allow/deny、無 ask;
+  # 預設全關,設 allow 是需 verified-owner 授權的決定(ADR 0005)。

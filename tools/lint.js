@@ -10,8 +10,10 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { parseHookRegistry } = require('./lib/parse');
 
 const REPO = path.resolve(__dirname, '..');
+const CANONICAL_HOOK_EVENTS = ['pre-tool', 'post-tool', 'session-start', 'stop', 'user-prompt-submit'];
 const errors = [];
 const err = (m) => errors.push(m);
 
@@ -72,6 +74,30 @@ if (fs.existsSync(reg)) {
       }
     }
   });
+}
+
+// ---- hooks registry (ADR 0005) ----
+const hookReg = path.join(REPO, 'hooks', 'registry.yaml');
+if (fs.existsSync(hookReg)) {
+  const hooks = parseHookRegistry(fs.readFileSync(hookReg, 'utf8'));
+  const names = new Set();
+  for (const h of hooks) {
+    const at = `hooks/registry.yaml '${h.name || '(unnamed)'}'`;
+    if (!h.name) { err(`${at}: missing name`); continue; }
+    if (!/^[a-z0-9-]{1,64}$/.test(h.name)) err(`${at}: name must be kebab-case, ≤64`);
+    if (names.has(h.name)) err(`${at}: duplicate hook name`);
+    names.add(h.name);
+    if (!h.event) err(`${at}: missing event`);
+    else if (!CANONICAL_HOOK_EVENTS.includes(h.event)) {
+      err(`${at}: event '${h.event}' not canonical (${CANONICAL_HOOK_EVENTS.join(' | ')})`);
+    }
+    if (!h.command) err(`${at}: missing command`);
+    // external hook = auto-exec third-party code → must be pinned + checksummed (ADR 0002 D6 / 0005 D4)
+    if (/^external:/i.test(h.source || '')) {
+      if (!h['pinned-ref'] || /^n\/a$/i.test(h['pinned-ref'])) err(`${at}: external hook needs a real pinned-ref`);
+      if (!h.checksum || /^n\/a$/i.test(h.checksum)) err(`${at}: external hook needs a checksum`);
+    }
+  }
 }
 
 if (errors.length) {

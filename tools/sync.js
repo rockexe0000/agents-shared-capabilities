@@ -13,7 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { parseRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
+const { parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
 
 const REPO = path.resolve(__dirname, '..');
 const HOME = process.env.HOME || os.homedir();
@@ -34,6 +34,8 @@ const MCP_PROJECTORS = [
 ];
 // facade-route projector: register sources behind the OAB MCP Facade (openab mcp.json).
 const FACADE_PROJECTOR = require('./projectors/oab-facade');
+// hook projectors (ADR 0005). MVP: claude-code only; others join as they gain projectHooks.
+const HOOK_PROJECTORS = [require('./projectors/claude-code')];
 const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless marked `route: direct`
 
 // --render <outdir> --capabilities <file>: emit config ARTIFACTS off-pod (for infra to
@@ -59,6 +61,14 @@ function buildRegistry(base) {
   const load = (f) => (fs.existsSync(f) ? parseRegistry(fs.readFileSync(f, 'utf8')) : []);
   const byName = new Map(load(path.join(REPO, 'mcp', 'registry.yaml')).map((s) => [s.name, s]));
   if (base) for (const s of load(path.join(base, 'mcp', 'registry.yaml'))) byName.set(s.name, s);
+  return byName;
+}
+
+// Same as buildRegistry but for hooks/registry.yaml (ADR 0005). 個人覆蓋 catalog.
+function buildHookRegistry(base) {
+  const load = (f) => (fs.existsSync(f) ? parseHookRegistry(fs.readFileSync(f, 'utf8')) : []);
+  const byName = new Map(load(path.join(REPO, 'hooks', 'registry.yaml')).map((h) => [h.name, h]));
+  if (base) for (const h of load(path.join(base, 'hooks', 'registry.yaml'))) byName.set(h.name, h);
   return byName;
 }
 
@@ -127,6 +137,31 @@ if (enable.mcp.length) {
   if (facade.length) {
     const r = FACADE_PROJECTOR.projectMcp(facade, HOME, { dry: DRY });
     console.log(`\n[oab-facade sources] ${DRY ? 'would register' : 'registered'} ${r.updated.join(', ')} → ${r.target}${DRY ? '' : ' (.bak saved)'}`);
+  }
+}
+
+// ---- hooks (ADR 0005) ----
+// Only effect=allow is projected; deny/unlisted is not (default all-off). We still
+// run the projector when the enabled set is empty so a now-disabled hook is stripped
+// from configs that still carry a previously-projected entry.
+const enabledHooks = enable.hooks.filter((h) => h.effect === 'allow');
+const deniedHooks = enable.hooks.filter((h) => h.effect === 'deny');
+console.log(`\nenabled hooks (allow): ${enabledHooks.map((h) => h.name).join(', ') || '(none)'}` +
+  (deniedHooks.length ? `  |  deny: ${deniedHooks.map((h) => h.name).join(', ')}` : ''));
+{
+  const byName = buildHookRegistry(PBASE);
+  const resolved = [];
+  for (const want of enabledHooks) {
+    const def = byName.get(want.name);
+    if (!def) { console.log(`  ${want.name}: ERROR not in hook registry`); continue; }
+    resolved.push(def);
+  }
+  for (const p of HOOK_PROJECTORS) {
+    if (typeof p.projectHooks !== 'function') continue;
+    if (!p.installed(HOME)) { console.log(`\n[${p.id} hooks] skip (not installed)`); continue; }
+    const r = p.projectHooks(resolved, HOME, { dry: DRY });
+    const skip = r.skipped.length ? `; skipped(unmapped): ${r.skipped.map((s) => `${s.name}(${s.event})`).join(', ')}` : '';
+    console.log(`\n[${p.id} hooks] ${DRY ? 'would set' : 'set'} ${r.updated.join(', ') || '(none)'} → ${r.target}${DRY ? '' : ' (.bak saved)'}${skip}`);
   }
 }
 

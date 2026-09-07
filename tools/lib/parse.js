@@ -101,13 +101,16 @@ function parseRegistry(text) {
 
 /**
  * Parse ~/personal/capabilities.md enable-list.
- * Returns { skills:[{name,source}], mcp:[{name, tools:[]}] }.
+ * Returns { skills:[{name,source}], mcp:[{name, tools:[]}], hooks:[{name, effect}] }.
+ * hooks carry an allow/deny `effect` (ADR 0005): default all-off; a listed hook
+ * enables only when effect=allow. There is no `ask` — a hook auto-executes and
+ * bypasses the runtime authorization gate, so authorization is this allow/deny.
  */
 function parseEnable(file) {
-  if (!fs.existsSync(file)) return { skills: [], mcp: [] };
+  if (!fs.existsSync(file)) return { skills: [], mcp: [], hooks: [] };
   const body = fs.readFileSync(file, 'utf8').replace(/^---\n[\s\S]*?\n---/, '');
-  const out = { skills: [], mcp: [] };
-  let top = null; // 'skills' | 'mcp'
+  const out = { skills: [], mcp: [], hooks: [] };
+  let top = null; // 'skills' | 'mcp' | 'hooks'
   let mcpServers = false;
   let cur = null;
   for (const raw of body.split('\n')) {
@@ -124,9 +127,44 @@ function parseEnable(file) {
       // inline form: `- { name: x, tools: [...] }` or block `- name: x`
       const inl = raw.match(/^\s*-\s*\{?\s*name:\s*([A-Za-z0-9_-]+)/);
       if (mcpServers && inl) { cur = { name: inl[1], tools: [] }; out.mcp.push(cur); }
+    } else if (top === 'hooks') {
+      // inline `- { name: x, effect: allow }` or block `- name: x` + `effect: allow|deny`
+      const inl = raw.match(/^\s*-\s*\{?\s*name:\s*([A-Za-z0-9_-]+)(?:.*effect:\s*(allow|deny))?/);
+      if (inl) { cur = { name: inl[1], effect: inl[2] || 'allow' }; out.hooks.push(cur); continue; }
+      const eff = raw.match(/^\s*effect:\s*(allow|deny)\b/);
+      if (eff && cur) cur.effect = eff[1];
     }
   }
   return out;
+}
+
+/**
+ * Parse hooks/registry.yaml -> [{name, event, matcher, command, description,
+ * source, 'pinned-ref', checksum}]. Flat shape (2-space indent items, 4-space
+ * props), plus a nested `capability:` map for the description. `event` is a
+ * canonical event name (see CANONICAL_HOOK_EVENTS in lint.js / projectors).
+ */
+function parseHookRegistry(text) {
+  const hooks = [];
+  let cur = null;
+  let section = null; // 'capability' | null
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = line.match(/^\s*/)[0].length;
+    const t = line.trim();
+    const item = t.match(/^-\s*name:\s*(.+)$/);
+    if (item && indent <= 2) { cur = { name: strip(item[1]) }; hooks.push(cur); section = null; continue; }
+    if (!cur) continue;
+    const opener = t.match(/^([\w-]+):\s*$/);
+    if (opener && indent === 4) { section = opener[1]; continue; }
+    const kv = t.match(/^([\w-]+):\s*(.*)$/);
+    if (!kv) continue;
+    if (section === 'capability' && indent >= 6) { if (kv[1] === 'description') cur.description = strip(kv[2]); continue; }
+    section = null;
+    cur[kv[1]] = strip(kv[2]);
+  }
+  return hooks;
 }
 
 /** load secrets/.env into a plain object (KEY=VALUE) */
@@ -198,4 +236,4 @@ function resolveServer(s, env) {
   return { server: out, unresolved };
 }
 
-module.exports = { strip, parseRegistry, parseEnable, loadDotenv, resolveRef, resolveServer };
+module.exports = { strip, parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveRef, resolveServer };
