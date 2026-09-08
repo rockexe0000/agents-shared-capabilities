@@ -10,7 +10,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { parseHookRegistry } = require('./lib/parse');
+const { parseHookRegistry, parseBinRegistry } = require('./lib/parse');
 
 const REPO = path.resolve(__dirname, '..');
 const CANONICAL_HOOK_EVENTS = ['pre-tool', 'post-tool', 'session-start', 'stop', 'user-prompt-submit'];
@@ -28,6 +28,75 @@ function scalar(fm, key) {
   const m = fm.match(re);
   if (!m) return null;
   return m[1].trim().replace(/^["']|["']$/g, '');
+}
+
+/** semver-ish compare (strip leading v/=, numeric per dotted field). a<b:-1, a==b:0, a>b:1. */
+function cmpVer(a, b) {
+  const norm = (v) => String(v).replace(/^[v=]/, '').split(/[.+-]/).map((n) => parseInt(n, 10));
+  const A = norm(a), B = norm(b);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = A[i] || 0, y = B[i] || 0;
+    if (isNaN(x) || isNaN(y)) return 0; // non-numeric field → don't gate
+    if (x !== y) return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/** extract a SKILL.md `requires:` frontmatter block -> [{name, min}] (block or inline form). */
+function parseRequires(fm) {
+  const out = [];
+  const lines = fm.split('\n');
+  let i = lines.findIndex((l) => /^requires:\s*(#.*)?$/.test(l));
+  if (i < 0) {
+    const inl = fm.match(/^requires:\s*\[(.+)\]\s*$/m);
+    if (inl) {
+      const re = /name:\s*([A-Za-z0-9_-]+)(?:[^}]*?min:\s*["']?([0-9][\w.+-]*)["']?)?/g;
+      let m; while ((m = re.exec(inl[1]))) out.push({ name: m[1], min: m[2] || null });
+    }
+    return out;
+  }
+  for (i = i + 1; i < lines.length; i++) {
+    const nm = lines[i].match(/^\s*-\s*name:\s*([A-Za-z0-9_-]+)/);
+    if (nm) { out.push({ name: nm[1], min: null }); continue; }
+    const mn = lines[i].match(/^\s*min:\s*["']?([0-9][\w.+-]*)["']?/);
+    if (mn && out.length) { out[out.length - 1].min = mn[1]; continue; }
+    if (/^\S/.test(lines[i])) break; // dedent to next top-level key
+  }
+  return out;
+}
+
+// ---- bin registry (ADR 0006, 第四軸) ----
+// External binary/CLI deps a skill shells out to. External source ⇒ must be
+// pinned + per-platform checksummed (mirrors the hooks supply-chain rule).
+const binTools = new Map(); // name -> parsed tool entry (for skill `requires` cross-check)
+const binReg = path.join(REPO, 'bin', 'registry.yaml');
+if (fs.existsSync(binReg)) {
+  const tools = parseBinRegistry(fs.readFileSync(binReg, 'utf8'));
+  const names = new Set();
+  for (const t of tools) {
+    const at = `bin/registry.yaml '${t.name || '(unnamed)'}'`;
+    if (!t.name) { err(`${at}: missing name`); continue; }
+    if (!/^[a-z0-9-]{1,64}$/.test(t.name)) err(`${at}: name must be kebab-case, ≤64`);
+    if (names.has(t.name)) err(`${at}: duplicate tool name`);
+    names.add(t.name);
+    binTools.set(t.name, t);
+    if (!t.source) err(`${at}: missing source`);
+    if (t.provenance && !['none', 'attestation', 'cosign'].includes(t.provenance)) {
+      err(`${at}: provenance must be none|attestation|cosign`);
+    }
+    const external = /^external:/i.test(t.source || '');
+    const plats = Object.entries(t.platforms || {});
+    if (external) {
+      if (!t['pinned-version'] || /^n\/a$/i.test(t['pinned-version'])) err(`${at}: external tool needs a real pinned-version`);
+      if (!plats.length) err(`${at}: external tool needs at least one platform`);
+    }
+    for (const [p, spec] of plats) {
+      if (!spec.asset) err(`${at}: platform '${p}' missing asset`);
+      if (external || spec.sha256) {
+        if (!/^[a-f0-9]{64}$/i.test(spec.sha256 || '')) err(`${at}: platform '${p}' sha256 must be 64 hex`);
+      }
+    }
+  }
 }
 
 // ---- skills ----
@@ -49,6 +118,16 @@ if (fs.existsSync(skillsDir)) {
       if (/claude|anthropic/i.test(nm)) err(`skills/${name}: name must not contain claude/anthropic`);
     }
     if (!desc) err(`skills/${name}/SKILL.md: frontmatter 'description' missing/empty`);
+    // requires: each declared binary must resolve to bin/registry.yaml, and the
+    // registry's pinned-version must satisfy the skill's floor (ADR 0006 D2).
+    for (const r of parseRequires(fm)) {
+      const tool = binTools.get(r.name);
+      if (!tool) { err(`skills/${name}: requires '${r.name}' has no bin/registry.yaml entry`); continue; }
+      const pinned = tool['pinned-version'];
+      if (r.min && pinned && !/^n\/a$/i.test(pinned) && cmpVer(pinned, r.min) < 0) {
+        err(`skills/${name}: requires ${r.name} ≥ ${r.min} but bin registry pins ${pinned}`);
+      }
+    }
   }
 }
 

@@ -6,6 +6,9 @@ metadata:
 capability:
   tools: [Bash]   # additive --notify flag on cfdrop deploy (declaration, not authorization)
   network: true   # POSTs the live URL to a relay endpoint
+requires:         # native binary deps → bin/registry.yaml (ADR 0006)
+  - name: cfdrop
+    min: "0.6.1"  # floor: --notify relay push
 source: external:github.com/oablab/cfdrop
 pinned-ref: 66a5877653f8e8290605457652fa628c71d7ee05
 checksum: sha256:4b0c76fd7b958f83fa60df3233320220b6e48fcd623b790dc26d01670d05e0e9   # sha256 of upstream skills/cfdrop-relay/SKILL.md at pinned-ref (provenance anchor; vendored copy adds only the catalog keys above)

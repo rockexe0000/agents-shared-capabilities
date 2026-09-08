@@ -1,0 +1,29 @@
+# host-agnostic binary/CLI dependency registry(第四供給軸,ADR 0002 延伸 → ADR 0006)
+# skill 用 SKILL.md `requires: [{name, min}]` 引用此處定義的 binary;此檔只放「宣告」:
+# 釘版本 + 每平台 sha256(+選用 provenance)。安裝器(sync --with-tools / pod image bake)
+# 於 sync/build 時抓取並驗 checksum,不 live-link「latest」。
+# 個人專屬 binary 放 agent-bot/{uid}/bin/registry.yaml(personal 覆蓋 catalog)。
+# schema:templates/bin-tool.template.yaml;投影/安裝器見 tools/。
+#
+# 供應鏈(ADR 0006 D6):外部來源一律 pinned-version + 每平台 sha256(lint 強制);
+#   provenance: none | attestation | cosign —— 有就驗、none 為顯性降級(review 看得到)。
+#   版本 bump 由人發起、工具算 checksum、PR review 落地;安裝/執行外部 binary = permissions 的 ask 閘。
+tools:
+  # ── cfdrop:把目錄部署成臨時 Cloudflare 靜態站的自帶 Rust CLI(skills/cfdrop、cfdrop-relay 依賴)──
+  - name: cfdrop
+    source: external:github.com/oablab/cfdrop
+    pinned-version: v0.6.1        # releases HEAD@2026-08-28;滿足 cfdrop(mermaid≥0.4.0)與 cfdrop-relay(--notify≥0.6.1)floor
+    provenance: none             # 上游尚無 attestation;為顯性降級。TODO:請 oablab 開 GitHub artifact attestation
+    bin: cfdrop                  # 解壓後放上 PATH 的執行檔名
+    archive: tar.gz             # 下載物格式:tar.gz | zip | raw
+    url: "https://github.com/oablab/cfdrop/releases/download/${version}/${asset}"
+    platforms:
+      linux-amd64:
+        asset: cfdrop-linux-amd64.tar.gz
+        sha256: 57fe5b73c19caafc76c384be2e68b3e83d265129e16a9e579a5b3cdc04e5b62b
+      linux-arm64:
+        asset: cfdrop-linux-arm64.tar.gz
+        sha256: ad3523e5e29d550a1aeb4f4b0cefdda7468510c6c4bfe536334afe6f739497ad
+      macos-arm64:
+        asset: cfdrop-macos-arm64.tar.gz
+        sha256: 833e61af476b1148533dba82d182f61349a322940cb2668d128ec878bef93b07

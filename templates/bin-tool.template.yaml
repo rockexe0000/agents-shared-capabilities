@@ -1,0 +1,15 @@
+# bin/registry.yaml 條目範本(第四供給軸,ADR 0006)。複製 tools: 下一個項目後填寫。
+# 外部來源(source: external:…)一律要 pinned-version + 每平台 sha256(lint.js 強制)。
+- name: <kebab-case,≤64,唯一;skill 以此名 requires>
+  source: <built-in | external:<repo/url>>
+  pinned-version: <外部來源填 release tag/commit,如 v1.2.3;built-in 填 n/a>
+  provenance: <none | attestation | cosign>   # 有就驗;none = 顯性降級(ADR 0006 D6)
+  bin: <解壓後放上 PATH 的執行檔名;省略則同 name>
+  archive: <tar.gz | zip | raw>                # 下載物格式;raw = 直接就是執行檔
+  url: "<下載 URL 樣板;可用 ${version} 與 ${asset}>"
+  platforms:                                   # 支援的 (os-arch);缺的平台安裝器 fail loud,不裝錯架構
+    linux-amd64:
+      asset: <該平台的 release asset 檔名>
+      sha256: <該 asset 的 sha256(64 hex)>
+    # linux-arm64: { … }
+    # macos-arm64: { … }
