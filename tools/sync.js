@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
-const { loadBinTools, requiredToolNames, installTool, checkTool, gcTools, binDir, platformKey } = require('./lib/install-bin');
+const { loadBinTools, requiredToolNames, installTool, checkTool, gcTools, installDir, platformKey } = require('./lib/install-bin');
 
 const REPO = path.resolve(__dirname, '..');
 const HOME = process.env.HOME || os.homedir();
@@ -182,18 +182,16 @@ if (WITH_TOOLS) {
   const tools = loadBinTools(REPO, PBASE);
   const names = requiredToolNames(enable, REPO, PBASE);
   console.log(`required by enabled skills: ${names.join(', ') || '(none)'}`);
-  console.log(`managed bin dir: ${binDir(HOME)} (platform ${platformKey()})`);
+  const idir = DRY ? '(resolved at install)' : installDir(HOME); // installDir may create ~/.local/bin + warn
+  console.log(`install dir: ${idir} (platform ${platformKey()})`);
   for (const nm of names) {
     const t = tools.get(nm);
     if (!t) { console.log(`  ${nm}: ERROR not in bin/registry.yaml`); continue; }
-    try { const r = installTool(t, HOME, { dry: DRY }); console.log(`  ${r.name}: ${r.status} — ${r.detail}`); }
+    try { const r = installTool(t, HOME, { dry: DRY, destDir: DRY ? null : idir }); console.log(`  ${r.name}: ${r.status} — ${r.detail}`); }
     catch (e) { console.log(`  ${nm}: ERROR ${e.message}`); }
   }
   for (const g of gcTools(names, HOME, { dry: DRY })) {
     console.log(`  ${g.name}: ${DRY ? 'would remove' : 'removed'} (no longer required)`);
-  }
-  if (!(process.env.PATH || '').split(path.delimiter).includes(binDir(HOME))) {
-    console.log(`  note: add to PATH → export PATH="${binDir(HOME)}${path.delimiter}$PATH"`);
   }
 }
 
