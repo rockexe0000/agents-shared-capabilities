@@ -3,17 +3,18 @@
  * install-bin.js — the dev/host backend of the bin/ axis (ADR 0006 Phase B).
  *
  * Given the tools an agent's enabled skills `require`, fetch the pinned release
- * asset for THIS platform, verify its sha256, extract the binary into a managed
+ * asset for THIS platform, verify its sha256, extract the binary into an on-PATH
  * dir, and record a lockfile. Idempotent: an already-satisfied install is a
  * no-op. `checkTool` verifies installed state vs the registry for drift.
  *
  * Supply chain (ADR 0006 D6): a mismatched checksum aborts the install (never
  * runs a binary we didn't pin). Fetch plumbing is `curl` + `tar`/`unzip` — no
- * npm deps. The pod backend (image bake) is separate and reads the same registry.
+ * npm deps. The pod backend (bin-apply.js) uses the same install-dir precedence.
  *
- * Layout (managed, reversible — ADR 0006 D3):
- *   ~/.agents-shared-capabilities/state/bin/<bin>          the executable on PATH
- *   ~/.agents-shared-capabilities/state/bin-lock/<name>.json  install record
+ * Install location (ADR 0006 D3, refined 2026-09-08 to unify dev+pod): prefer
+ * ~/.local/bin when it's on PATH; else an existing writable HOME dir already on
+ * PATH; else ~/.local/bin with a warning. Lockfiles live under the managed state
+ * dir and record each tool's actual `target`, so GC/drift work wherever it landed.
  */
 const fs = require('fs');
 const path = require('path');
@@ -23,7 +24,6 @@ const { execFileSync } = require('child_process');
 const { parseBinRegistry, frontmatterBlock, parseRequires } = require('./parse');
 
 const stateRoot = (HOME) => path.join(HOME, '.agents-shared-capabilities', 'state');
-const binDir = (HOME) => path.join(stateRoot(HOME), 'bin');
 const lockDir = (HOME) => path.join(stateRoot(HOME), 'bin-lock');
 const lockPath = (HOME, name) => path.join(lockDir(HOME), name + '.json');
 
@@ -37,6 +37,20 @@ function platformKey() {
 
 function sha256File(f) {
   return crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+}
+
+// The dir binaries land in — shared precedence with the pod's bin-apply.js so dev
+// and pod agree. Side effect: may create ~/.local/bin and warn if it's off PATH.
+function installDir(HOME) {
+  if (process.env.BIN_INSTALL_DIR) return process.env.BIN_INSTALL_DIR;
+  const parts = (process.env.PATH || '').split(path.delimiter);
+  const local = path.join(HOME, '.local', 'bin');
+  const canWrite = (d) => { try { fs.accessSync(d, fs.constants.W_OK); return true; } catch (_) { return false; } };
+  if (parts.includes(local)) { fs.mkdirSync(local, { recursive: true }); if (canWrite(local)) return local; }
+  for (const d of parts) { if (d && d.startsWith(HOME) && fs.existsSync(d) && canWrite(d)) return d; }
+  fs.mkdirSync(local, { recursive: true });
+  if (!parts.includes(local)) console.log(`bin: WARN ${local} not on PATH — add it so required CLIs resolve`);
+  return local;
 }
 
 // catalog + personal bin registries → name→tool map (personal overrides catalog).
@@ -104,32 +118,33 @@ function extractBinary(arc, archive, binName, destDir) {
   return found;
 }
 
-// Install one tool for the current platform. Idempotent.
+// Install one tool for the current platform. Idempotent (uses the recorded target).
 // → {name, status: up-to-date|installed|updated|would-install|unsupported, detail}
-function installTool(tool, HOME, { dry = false } = {}) {
+function installTool(tool, HOME, { dry = false, destDir = null } = {}) {
   const pk = platformKey();
   const spec = (tool.platforms || {})[pk];
   const binName = tool.bin || tool.name;
   if (!spec) return { name: tool.name, status: 'unsupported', detail: `no asset for platform ${pk}` };
-  const target = path.join(binDir(HOME), binName);
   const lock = readLock(HOME, tool.name);
   const satisfied = lock && lock['pinned-version'] === tool['pinned-version'] &&
-    lock['asset-sha256'] === spec.sha256 && fs.existsSync(target) &&
-    sha256File(target) === lock['bin-sha256'];
-  if (satisfied) return { name: tool.name, status: 'up-to-date', detail: `${tool['pinned-version']} @ ${target}` };
-  if (dry) return { name: tool.name, status: 'would-install', detail: `${tool['pinned-version']} (${pk}) → ${target}` };
+    lock['asset-sha256'] === spec.sha256 && lock.target &&
+    fs.existsSync(lock.target) && sha256File(lock.target) === lock['bin-sha256'];
+  if (satisfied) return { name: tool.name, status: 'up-to-date', detail: `${tool['pinned-version']} @ ${lock.target}` };
+  if (dry) return { name: tool.name, status: 'would-install', detail: `${tool['pinned-version']} (${pk})` };
 
+  const dir = destDir || installDir(HOME);
+  const target = path.join(dir, binName);
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'binfetch-'));
   try {
     const arc = fetchVerified(urlFor(tool, spec), spec.sha256, path.join(tmpRoot, spec.asset));
     const extracted = extractBinary(arc, tool.archive || 'tar.gz', binName, path.join(tmpRoot, 'x'));
-    fs.mkdirSync(binDir(HOME), { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
     fs.copyFileSync(extracted, target);
     fs.chmodSync(target, 0o755);
     fs.mkdirSync(lockDir(HOME), { recursive: true });
     fs.writeFileSync(lockPath(HOME, tool.name), JSON.stringify({
       name: tool.name, 'pinned-version': tool['pinned-version'], platform: pk,
-      asset: spec.asset, 'asset-sha256': spec.sha256, 'bin-sha256': sha256File(target), bin: binName,
+      asset: spec.asset, 'asset-sha256': spec.sha256, 'bin-sha256': sha256File(target), target, bin: binName,
     }, null, 2) + '\n');
     return { name: tool.name, status: lock ? 'updated' : 'installed', detail: `${tool['pinned-version']} (${pk}) → ${target}` };
   } finally {
@@ -137,22 +152,20 @@ function installTool(tool, HOME, { dry = false } = {}) {
   }
 }
 
-// Verify installed state vs the registry (no network).
+// Verify installed state vs the registry (no network). Uses the recorded target.
 // → {name, status: ok|missing|stale|tampered|unsupported, detail}
 function checkTool(tool, HOME) {
   const pk = platformKey();
   const spec = (tool.platforms || {})[pk];
-  const binName = tool.bin || tool.name;
-  const target = path.join(binDir(HOME), binName);
   const lock = readLock(HOME, tool.name);
   if (!spec) return { name: tool.name, status: 'unsupported', detail: `no asset for platform ${pk}` };
-  if (!lock) return { name: tool.name, status: 'missing', detail: 'not installed (no lockfile)' };
-  if (!fs.existsSync(target)) return { name: tool.name, status: 'missing', detail: `binary gone: ${target}` };
+  if (!lock || !lock.target) return { name: tool.name, status: 'missing', detail: 'not installed (no lockfile)' };
+  if (!fs.existsSync(lock.target)) return { name: tool.name, status: 'missing', detail: `binary gone: ${lock.target}` };
   if (lock['pinned-version'] !== tool['pinned-version'] || lock['asset-sha256'] !== spec.sha256)
     return { name: tool.name, status: 'stale', detail: `installed ${lock['pinned-version']} but registry pins ${tool['pinned-version']}` };
-  if (sha256File(target) !== lock['bin-sha256'])
-    return { name: tool.name, status: 'tampered', detail: `on-disk sha256 != lock (${target})` };
-  return { name: tool.name, status: 'ok', detail: `${tool['pinned-version']} @ ${target}` };
+  if (sha256File(lock.target) !== lock['bin-sha256'])
+    return { name: tool.name, status: 'tampered', detail: `on-disk sha256 != lock (${lock.target})` };
+  return { name: tool.name, status: 'ok', detail: `${tool['pinned-version']} @ ${lock.target}` };
 }
 
 // GC: remove any managed binary/lock whose tool is no longer in `keepNames`.
@@ -168,7 +181,7 @@ function gcTools(keepNames, HOME, { dry = false } = {}) {
     if (keep.has(name)) continue;
     const lock = readLock(HOME, name);
     const paths = [lockPath(HOME, name)];
-    if (lock && lock.bin) paths.push(path.join(binDir(HOME), lock.bin));
+    if (lock && lock.target) paths.push(lock.target);
     if (!dry) for (const p of paths) fs.rmSync(p, { force: true });
     removed.push({ name, removed: paths });
   }
@@ -176,6 +189,6 @@ function gcTools(keepNames, HOME, { dry = false } = {}) {
 }
 
 module.exports = {
-  platformKey, binDir, lockDir, loadBinTools, requiredToolNames,
+  platformKey, installDir, lockDir, loadBinTools, requiredToolNames,
   installTool, checkTool, gcTools,
 };
