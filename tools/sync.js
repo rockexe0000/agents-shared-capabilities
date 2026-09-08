@@ -228,14 +228,48 @@ function buildArtifacts(capFile) {
   const binTools = loadBinTools(REPO, base);
   const binManifest = requiredToolNames(enable, REPO, base).map((n) => binTools.get(n)).filter(Boolean);
   const asBinManifest = JSON.stringify({ tools: binManifest }, null, 2) + '\n';
+  // skills manifest (ADR 0002 pod-projection gap; option-C): the enabled skills' files
+  // (SKILL.md + assets/scripts/…) base64'd, for the pod-side skills-apply.js to write
+  // into ~/.claude/skills. Pods have no catalog checkout, so the dev symlink projection
+  // can't reach them — this carries the files. Deterministic (sorted) so --check works.
+  const skillManifest = buildSkillManifest(enable, base);
+  const asSkillManifest = JSON.stringify({ skills: skillManifest }, null, 2) + '\n';
   return {
-    facade, direct, binManifest,
+    facade, direct, binManifest, skillManifest,
     files: {
       'openab-agent-mcp.json': asCfg(facade),
       'runtime-mcp.json': asCfg(direct),
       'bin-manifest.json': asBinManifest,
+      'skills-manifest.json': asSkillManifest,
     },
   };
+}
+
+// Collect enabled skills' files (base64) for pod projection. Catalog skills come from
+// REPO/skills/<name>, personal from base/skills/<name>. Files + skills are sorted for a
+// deterministic render (so --check can diff). configMaps cap ~1 MiB total — a very large
+// skill (big assets/scripts) needs a different transport; warn if the bundle is big.
+function buildSkillManifest(enable, base) {
+  const walk = (dir, prefix = '') => {
+    const out = [];
+    for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) out.push(...walk(path.join(dir, e.name), rel));
+      else out.push({ path: rel, content_b64: fs.readFileSync(path.join(dir, e.name)).toString('base64') });
+    }
+    return out;
+  };
+  const skills = [];
+  let bytes = 0;
+  for (const s of (enable.skills || []).slice().sort((a, b) => a.name.localeCompare(b.name))) {
+    const dir = s.source === 'personal' && base ? path.join(base, 'skills', s.name) : path.join(REPO, 'skills', s.name);
+    if (!fs.existsSync(dir)) { console.error(`  skill ${s.name}: source missing (${dir}) — skipped`); continue; }
+    const files = walk(dir);
+    bytes += files.reduce((n, f) => n + f.content_b64.length, 0);
+    skills.push({ name: s.name, source: s.source || 'catalog', files });
+  }
+  if (bytes > 900 * 1024) console.error(`  WARN skills manifest ~${Math.round(bytes / 1024)}KiB — near the 1 MiB configMap limit; consider a heavier transport for large skills`);
+  return skills;
 }
 
 // Bin drift check (ADR 0006 D5): verify each required tool's installed state vs
@@ -269,12 +303,13 @@ function render() {
     process.exit(1);
   }
   const capFile = capFileArg();
-  const { facade, direct, binManifest, files } = buildArtifacts(capFile);
+  const { facade, direct, binManifest, skillManifest, files } = buildArtifacts(capFile);
   fs.mkdirSync(outDir, { recursive: true });
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(outDir, name), text);
   console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
   console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'})`);
-  console.log(`rendered bin-manifest.json   (tools:  ${binManifest.map((t) => `${t.name}@${t['pinned-version']}`).join(', ') || 'none'}) → ${outDir}`);
+  console.log(`rendered bin-manifest.json   (tools:  ${binManifest.map((t) => `${t.name}@${t['pinned-version']}`).join(', ') || 'none'})`);
+  console.log(`rendered skills-manifest.json(skills: ${skillManifest.map((s) => `${s.name}(${s.files.length}f)`).join(', ') || 'none'}) → ${outDir}`);
 }
 
 // Drift check: re-render from the catalog + capabilities.md and compare against the
