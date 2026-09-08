@@ -222,9 +222,19 @@ function buildArtifacts(capFile) {
   }
   const shape = FACADE_PROJECTOR.shapeServer;
   const asCfg = (list) => JSON.stringify({ mcpServers: Object.fromEntries(list.map((s) => [s.name, shape(s)])) }, null, 2) + '\n';
+  // bin manifest (ADR 0006 Phase D, option-C): the subset of bin/registry.yaml the
+  // agent's enabled skills require, for the pod-side bin-apply.js to fetch+verify at
+  // pre_boot. Platform is resolved on the pod (all platforms carried here).
+  const binTools = loadBinTools(REPO, base);
+  const binManifest = requiredToolNames(enable, REPO, base).map((n) => binTools.get(n)).filter(Boolean);
+  const asBinManifest = JSON.stringify({ tools: binManifest }, null, 2) + '\n';
   return {
-    facade, direct,
-    files: { 'openab-agent-mcp.json': asCfg(facade), 'runtime-mcp.json': asCfg(direct) },
+    facade, direct, binManifest,
+    files: {
+      'openab-agent-mcp.json': asCfg(facade),
+      'runtime-mcp.json': asCfg(direct),
+      'bin-manifest.json': asBinManifest,
+    },
   };
 }
 
@@ -259,11 +269,12 @@ function render() {
     process.exit(1);
   }
   const capFile = capFileArg();
-  const { facade, direct, files } = buildArtifacts(capFile);
+  const { facade, direct, binManifest, files } = buildArtifacts(capFile);
   fs.mkdirSync(outDir, { recursive: true });
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(outDir, name), text);
   console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
-  console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'}) → ${outDir}`);
+  console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'})`);
+  console.log(`rendered bin-manifest.json   (tools:  ${binManifest.map((t) => `${t.name}@${t['pinned-version']}`).join(', ') || 'none'}) → ${outDir}`);
 }
 
 // Drift check: re-render from the catalog + capabilities.md and compare against the
