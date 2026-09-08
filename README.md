@@ -45,7 +45,8 @@ registry 每個 server 標 `route`(預設 `facade`):
 skill 會 shell out 的 native binary/CLI 在 `bin/registry.yaml` 宣告一次(`name` / `source` / `pinned-version` / 每個 `(os-arch)` 的 `asset`+`sha256`〔+選用 `provenance`〕);skill 於 `SKILL.md` frontmatter 用 `requires: [{name, min}]` 引用,`min` 是版本地板。
 
 - **供應鏈**:外部來源一律 pinned-version + per-platform sha256(`lint.js` 強制);`provenance: none|attestation|cosign`(有就驗、`none` 為顯性降級)。安裝/執行外部 binary 過 permissions 的 `ask` 閘。
-- **安裝(規劃中)**:dev 走 `sync.js --with-tools`(opt-in,抓釘版 asset→驗 sha256→受管 bin dir 掛 PATH);pod 走 agents-infra build-time 讀同一 manifest 烤進 image。`sync.js --check` 做漂移驗證。實作進度見 handoff `agents-cold-memory:shared/handoffs/discord-1546431897800933426-binary-dependency-provisioning`。
+- **安裝(dev,已實作)**:`node tools/sync.js --with-tools`(opt-in)算 enabled skills 的 required-bins 閉包 → 抓釘版 asset → 驗 sha256 → 落受管 bin dir(`~/.agents-shared-capabilities/state/bin`)並提示掛 PATH;冪等(已裝且 checksum 相符則 skip),不再 required 的自動 GC。`node tools/sync.js --check-tools [--capabilities <f>]` 驗安裝漂移(present/版本/checksum,漂移 exit 1,供 CI/cron)。
+- **安裝(pod,規劃中)**:agents-infra build-time 讀同一 manifest 烤進 image。實作進度見 handoff `agents-cold-memory:shared/handoffs/discord-1546431897800933426-binary-dependency-provisioning`。
 - **lint**:`requires` 必須 resolve 到 `bin/registry.yaml`,且釘版 ≥ 各 requiring skill 的 `min`。
 
 ## 用法

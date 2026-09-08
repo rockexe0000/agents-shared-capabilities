@@ -10,7 +10,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { parseHookRegistry, parseBinRegistry } = require('./lib/parse');
+const { parseHookRegistry, parseBinRegistry, parseRequires } = require('./lib/parse');
 
 const REPO = path.resolve(__dirname, '..');
 const CANONICAL_HOOK_EVENTS = ['pre-tool', 'post-tool', 'session-start', 'stop', 'user-prompt-submit'];
@@ -40,29 +40,6 @@ function cmpVer(a, b) {
     if (x !== y) return x < y ? -1 : 1;
   }
   return 0;
-}
-
-/** extract a SKILL.md `requires:` frontmatter block -> [{name, min}] (block or inline form). */
-function parseRequires(fm) {
-  const out = [];
-  const lines = fm.split('\n');
-  let i = lines.findIndex((l) => /^requires:\s*(#.*)?$/.test(l));
-  if (i < 0) {
-    const inl = fm.match(/^requires:\s*\[(.+)\]\s*$/m);
-    if (inl) {
-      const re = /name:\s*([A-Za-z0-9_-]+)(?:[^}]*?min:\s*["']?([0-9][\w.+-]*)["']?)?/g;
-      let m; while ((m = re.exec(inl[1]))) out.push({ name: m[1], min: m[2] || null });
-    }
-    return out;
-  }
-  for (i = i + 1; i < lines.length; i++) {
-    const nm = lines[i].match(/^\s*-\s*name:\s*([A-Za-z0-9_-]+)/);
-    if (nm) { out.push({ name: nm[1], min: null }); continue; }
-    const mn = lines[i].match(/^\s*min:\s*["']?([0-9][\w.+-]*)["']?/);
-    if (mn && out.length) { out[out.length - 1].min = mn[1]; continue; }
-    if (/^\S/.test(lines[i])) break; // dedent to next top-level key
-  }
-  return out;
 }
 
 // ---- bin registry (ADR 0006, 第四軸) ----
