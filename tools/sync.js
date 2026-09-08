@@ -8,16 +8,23 @@
  *   MCP    → 解析 registry + 解密 secret 參照 → 各 runtime projector 安全 merge。
  *
  * 授權(閘 2)不在此:skill script / MCP tool 執行時過 Hot Permission Boundary。
- * Usage: node tools/sync.js [--dry-run]
+ *
+ * Binary deps (ADR 0006, opt-in): --with-tools fetches+verifies the pinned CLIs
+ * that enabled skills `require` into a managed bin dir; --check-tools verifies
+ * installed state for drift (exit 1). Both default OFF.
+ *
+ * Usage: node tools/sync.js [--dry-run] [--with-tools] [--check-tools]
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
+const { loadBinTools, requiredToolNames, installTool, checkTool, gcTools, binDir, platformKey } = require('./lib/install-bin');
 
 const REPO = path.resolve(__dirname, '..');
 const HOME = process.env.HOME || os.homedir();
 const DRY = process.argv.includes('--dry-run');
+const WITH_TOOLS = process.argv.includes('--with-tools');
 
 const SKILL_RUNTIMES = [
   { id: 'claude-code', base: path.join(HOME, '.claude'), skillsDir: path.join(HOME, '.claude', 'skills') },
@@ -42,6 +49,7 @@ const DEFAULT_ROUTE = 'facade'; // policy: MCP hides behind oab-facade unless ma
 // bake as a configMap) instead of projecting into a live HOME. Secrets stay ${env:} refs.
 if (process.argv.includes('--render')) { render(); process.exit(0); }
 if (process.argv.includes('--check')) { check(); /* check() exits */ }
+if (process.argv.includes('--check-tools')) { checkTools(); /* exits */ }
 
 // Resolve the agent's cold namespace base (agent-bot/{uid}) from ~/personal, which
 // is symlinked to agent-bot/{uid}/personal. Its parent dir holds the sibling
@@ -165,6 +173,30 @@ console.log(`\nenabled hooks (allow): ${enabledHooks.map((h) => h.name).join(', 
   }
 }
 
+// ---- bin tools (ADR 0006 Phase B; opt-in via --with-tools) ----
+// Fetch+verify the pinned CLIs enabled skills require into a managed bin dir,
+// then GC any managed tool no longer required. Network + on-disk executables =
+// a real blast radius, so this is off unless --with-tools is passed.
+if (WITH_TOOLS) {
+  console.log('\n[bin tools]');
+  const tools = loadBinTools(REPO, PBASE);
+  const names = requiredToolNames(enable, REPO, PBASE);
+  console.log(`required by enabled skills: ${names.join(', ') || '(none)'}`);
+  console.log(`managed bin dir: ${binDir(HOME)} (platform ${platformKey()})`);
+  for (const nm of names) {
+    const t = tools.get(nm);
+    if (!t) { console.log(`  ${nm}: ERROR not in bin/registry.yaml`); continue; }
+    try { const r = installTool(t, HOME, { dry: DRY }); console.log(`  ${r.name}: ${r.status} — ${r.detail}`); }
+    catch (e) { console.log(`  ${nm}: ERROR ${e.message}`); }
+  }
+  for (const g of gcTools(names, HOME, { dry: DRY })) {
+    console.log(`  ${g.name}: ${DRY ? 'would remove' : 'removed'} (no longer required)`);
+  }
+  if (!(process.env.PATH || '').split(path.delimiter).includes(binDir(HOME))) {
+    console.log(`  note: add to PATH → export PATH="${binDir(HOME)}${path.delimiter}$PATH"`);
+  }
+}
+
 console.log('\ndone' + (DRY ? ' (dry-run)' : ''));
 
 // ---- render / check (off-pod artifact generation; MCP only) ----
@@ -194,6 +226,30 @@ function buildArtifacts(capFile) {
     facade, direct,
     files: { 'openab-agent-mcp.json': asCfg(facade), 'runtime-mcp.json': asCfg(direct) },
   };
+}
+
+// Bin drift check (ADR 0006 D5): verify each required tool's installed state vs
+// the registry (present / version / checksum). Exits 1 on drift for CI / cron.
+// Honors --capabilities so infra can check a specific agent. No network, no HOME writes.
+function checkTools() {
+  const capFile = capFileArg();
+  let base = null;
+  try { base = path.dirname(path.dirname(fs.realpathSync(capFile))); } catch (_) {}
+  const enableC = parseEnable(capFile);
+  const tools = loadBinTools(REPO, base);
+  const names = requiredToolNames(enableC, REPO, base);
+  console.log(`bin drift check (platform ${platformKey()}) — required: ${names.join(', ') || '(none)'}`);
+  let drift = false;
+  for (const nm of names) {
+    const t = tools.get(nm);
+    if (!t) { drift = true; console.error(`  ${nm}: DRIFT — not in bin/registry.yaml`); continue; }
+    const r = checkTool(t, HOME);
+    const clean = r.status === 'ok' || r.status === 'unsupported';
+    if (!clean) drift = true;
+    (clean ? console.log : console.error)(`  ${r.name}: ${r.status.toUpperCase()} — ${r.detail}`);
+  }
+  console.log(drift ? '\nbin drift detected — run `node tools/sync.js --with-tools`' : '\nno bin drift — installed tools current');
+  process.exit(drift ? 1 : 0);
 }
 
 function render() {

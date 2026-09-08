@@ -206,6 +206,39 @@ function parseBinRegistry(text) {
   return tools;
 }
 
+/** extract the leading `---` frontmatter block of a SKILL.md as raw text ('' if none). */
+function frontmatterBlock(text) {
+  const m = text.match(/^---\n([\s\S]*?)\n---/);
+  return m ? m[1] : '';
+}
+
+/**
+ * Parse a SKILL.md frontmatter's `requires:` -> [{name, min}] (block or inline
+ * form). Shared by lint.js (floor/resolve check) and the bin installer (ADR 0006).
+ * The `requires:` line may carry a trailing comment.
+ */
+function parseRequires(fm) {
+  const out = [];
+  const lines = String(fm).split('\n');
+  let i = lines.findIndex((l) => /^requires:\s*(#.*)?$/.test(l));
+  if (i < 0) {
+    const inl = String(fm).match(/^requires:\s*\[(.+)\]\s*$/m);
+    if (inl) {
+      const re = /name:\s*([A-Za-z0-9_-]+)(?:[^}]*?min:\s*["']?([0-9][\w.+-]*)["']?)?/g;
+      let m; while ((m = re.exec(inl[1]))) out.push({ name: m[1], min: m[2] || null });
+    }
+    return out;
+  }
+  for (i = i + 1; i < lines.length; i++) {
+    const nm = lines[i].match(/^\s*-\s*name:\s*([A-Za-z0-9_-]+)/);
+    if (nm) { out.push({ name: nm[1], min: null }); continue; }
+    const mn = lines[i].match(/^\s*min:\s*["']?([0-9][\w.+-]*)["']?/);
+    if (mn && out.length) { out[out.length - 1].min = mn[1]; continue; }
+    if (/^\S/.test(lines[i])) break; // dedent to next top-level key
+  }
+  return out;
+}
+
 /** load secrets/.env into a plain object (KEY=VALUE) */
 function loadDotenv(repo) {
   const f = path.join(repo, 'secrets', '.env');
@@ -275,4 +308,4 @@ function resolveServer(s, env) {
   return { server: out, unresolved };
 }
 
-module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, loadDotenv, resolveRef, resolveServer };
+module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, frontmatterBlock, parseRequires, loadDotenv, resolveRef, resolveServer };
