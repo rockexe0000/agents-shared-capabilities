@@ -6,6 +6,9 @@ metadata:
 capability:
   tools: [Bash, Write, Read]   # runs the cfdrop CLI + generates site files (declaration, not authorization)
   network: true                # provisions a temp Cloudflare account and uploads assets
+requires:                      # native binary deps → bin/registry.yaml (ADR 0006)
+  - name: cfdrop
+    min: "0.4.0"               # floor: mermaid rendering (syntax highlight ≥0.3.0, --md ≥0.2.0)
 source: external:github.com/oablab/cfdrop
 pinned-ref: 66a5877653f8e8290605457652fa628c71d7ee05
 checksum: sha256:83f2b5733db91876f90fbf0cadcccb1b8c472fcc419372d192b69840fcd68c1a   # sha256 of upstream skills/cfdrop/SKILL.md at pinned-ref (provenance anchor; this vendored copy adds only the catalog keys above)

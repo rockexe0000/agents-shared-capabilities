@@ -167,6 +167,45 @@ function parseHookRegistry(text) {
   return hooks;
 }
 
+/**
+ * Parse bin/registry.yaml -> [{name, source, 'pinned-version', provenance, bin,
+ * archive, url, platforms:{ '<os-arch>': {asset, sha256} }}] (ADR 0006, 第四軸).
+ * Shape: `tools:` then `  - name: X` items with 4-space props, plus a nested
+ * `platforms:` map whose keys (`<os>-<arch>` at indent 6) each hold `asset` /
+ * `sha256` at indent 8. Declaration only — the installer fetches + verifies.
+ */
+function parseBinRegistry(text) {
+  const tools = [];
+  let cur = null;
+  let inPlatforms = false;
+  let plat = null;
+  for (const raw of text.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const indent = line.match(/^\s*/)[0].length;
+    const t = line.trim();
+    const item = t.match(/^-\s*name:\s*(.+)$/);
+    if (item && indent <= 2) { cur = { name: strip(item[1]), platforms: {} }; tools.push(cur); inPlatforms = false; plat = null; continue; }
+    if (!cur) continue;
+    if (indent === 4 && /^platforms:\s*$/.test(t)) { inPlatforms = true; plat = null; continue; }
+    if (inPlatforms && indent === 6) {
+      const p = t.match(/^([\w-]+):\s*$/);
+      if (p) { plat = p[1]; cur.platforms[plat] = {}; continue; }
+    }
+    if (inPlatforms && indent >= 8 && plat) {
+      const kv = t.match(/^([\w-]+):\s*(.*)$/);
+      if (kv) cur.platforms[plat][kv[1]] = strip(kv[2]);
+      continue;
+    }
+    if (indent <= 4) {
+      inPlatforms = false; plat = null;
+      const kv = t.match(/^([\w-]+):\s*(.*)$/);
+      if (kv && kv[1] !== 'platforms') cur[kv[1]] = strip(kv[2]);
+    }
+  }
+  return tools;
+}
+
 /** load secrets/.env into a plain object (KEY=VALUE) */
 function loadDotenv(repo) {
   const f = path.join(repo, 'secrets', '.env');
@@ -236,4 +275,4 @@ function resolveServer(s, env) {
   return { server: out, unresolved };
 }
 
-module.exports = { strip, parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveRef, resolveServer };
+module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, loadDotenv, resolveRef, resolveServer };

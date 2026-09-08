@@ -17,10 +17,11 @@
 ## Layout
 
 ```
-skills/<name>/SKILL.md        # 集體 skill(frontmatter name+description;可帶 references/ scripts/ assets/)
+skills/<name>/SKILL.md        # 集體 skill(frontmatter name+description;可帶 references/ scripts/ assets/;`requires:` 引用 bin/)
 mcp/registry.yaml             # host-agnostic MCP server 定義(secret 只放參照)
 hooks/registry.yaml           # host-agnostic hook 定義(canonical event + command;ADR 0005)
-templates/                    # SKILL / mcp-server / hook / capabilities 範本
+bin/registry.yaml             # host-agnostic binary/CLI 依賴定義(釘版本 + per-platform sha256;ADR 0006)
+templates/                    # SKILL / mcp-server / hook / bin-tool / capabilities 範本
 secrets/.env.example          # MCP 需要的環境變數「名稱」清單;真值放本地 secrets/.env(gitignore)
 tools/
   sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
@@ -38,6 +39,14 @@ registry 每個 server 標 `route`(預設 `facade`):
 
 - **facade**(預設):藏在 OAB MCP Facade 後面的 source(寫進 openab `~/.openab/agent/mcp.json`)。agent runtime **只連 loopback facade、不持任何 key**;secret 以 `${env:VAR}` 由 openab 解析。所有 Coding Agent 走同一個 facade endpoint,新增 MCP 設一次、全 runtime 共用。
 - **direct**:直接投影進各 runtime 的 MCP config。例外用途:① facade 本身(`oab-facade`)② 沒有 openab facade 的 host ③ facade 不能代理的 source。
+
+## Binary 依賴(`bin/`,第四軸,ADR 0006)
+
+skill 會 shell out 的 native binary/CLI 在 `bin/registry.yaml` 宣告一次(`name` / `source` / `pinned-version` / 每個 `(os-arch)` 的 `asset`+`sha256`〔+選用 `provenance`〕);skill 於 `SKILL.md` frontmatter 用 `requires: [{name, min}]` 引用,`min` 是版本地板。
+
+- **供應鏈**:外部來源一律 pinned-version + per-platform sha256(`lint.js` 強制);`provenance: none|attestation|cosign`(有就驗、`none` 為顯性降級)。安裝/執行外部 binary 過 permissions 的 `ask` 閘。
+- **安裝(規劃中)**:dev 走 `sync.js --with-tools`(opt-in,抓釘版 asset→驗 sha256→受管 bin dir 掛 PATH);pod 走 agents-infra build-time 讀同一 manifest 烤進 image。`sync.js --check` 做漂移驗證。實作進度見 handoff `agents-cold-memory:shared/handoffs/discord-1546431897800933426-binary-dependency-provisioning`。
+- **lint**:`requires` 必須 resolve 到 `bin/registry.yaml`,且釘版 ≥ 各 requiring skill 的 `min`。
 
 ## 用法
 
