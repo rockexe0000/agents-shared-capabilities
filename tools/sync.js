@@ -21,6 +21,7 @@ const os = require('os');
 const { execFileSync } = require('child_process');
 const { parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
 const { loadBinTools, requiredToolNames, installTool, checkTool, gcTools, installDir, platformKey } = require('./lib/install-bin');
+const { buildAuthz, mapAuthz, suggestText, AUTHZ_RUNTIMES } = require('./lib/authz');
 
 const REPO = path.resolve(__dirname, '..');
 const HOME = process.env.HOME || os.homedir();
@@ -236,14 +237,27 @@ function buildArtifacts(capFile) {
   // skills' dirs (each rooted at <name>/…), base64'd for the text configMap; +
   // skills.list for GC. Pods have no catalog checkout, so this carries the files.
   const bundle = buildSkillsBundle(enable, base);
+  // authz fragments (ADR 0007, 閘 2): per-runtime allow/deny the pod's perms-apply
+  // merges into the runtime's native permission config. Read permissions.md beside
+  // the capabilities file (same personal namespace). Deterministic (sorted) so
+  // --check diffs. Emitted for every mapped runtime; each overlay picks its own.
+  const permsFile = path.join(path.dirname(capFile), 'permissions.md');
+  const permsText = fs.existsSync(permsFile) ? fs.readFileSync(permsFile, 'utf8') : '';
+  const authz = buildAuthz(enable, permsText, REPO, base);
+  const authzFiles = {};
+  for (const rt of AUTHZ_RUNTIMES) {
+    authzFiles[`authz-${rt}.json`] = JSON.stringify(mapAuthz(rt, authz), null, 2) + '\n';
+  }
+  authzFiles['authz-suggest.txt'] = suggestText(authz);
   return {
-    facade, direct, binList, skillNames: bundle.names,
+    facade, direct, binList, skillNames: bundle.names, authz,
     files: {
       'openab-agent-mcp.json': asCfg(facade),
       'runtime-mcp.json': asCfg(direct),
       'bin-install.tsv': binTsv,
       'skills.tar.b64': bundle.tarB64,
       'skills.list': bundle.list,
+      ...authzFiles,
     },
   };
 }
@@ -332,13 +346,14 @@ function render() {
     process.exit(1);
   }
   const capFile = capFileArg();
-  const { facade, direct, binList, skillNames, files } = buildArtifacts(capFile);
+  const { facade, direct, binList, skillNames, authz, files } = buildArtifacts(capFile);
   fs.mkdirSync(outDir, { recursive: true });
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(outDir, name), text);
   console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
   console.log(`rendered runtime-mcp.json    (direct: ${direct.map((s) => s.name).join(', ') || 'none'})`);
   console.log(`rendered bin-install.tsv     (tools:  ${binList.map((t) => `${t.name}@${t['pinned-version']}`).join(', ') || 'none'})`);
-  console.log(`rendered skills.tar.b64      (skills: ${skillNames.join(', ') || 'none'}) → ${outDir}`);
+  console.log(`rendered skills.tar.b64      (skills: ${skillNames.join(', ') || 'none'})`);
+  console.log(`rendered authz-*.json        (mode ${authz.flag}; allow: ${authz.allow.join(', ') || 'none'}${authz.deny.length ? `; deny: ${authz.deny.join(', ')}` : ''}) → ${outDir}`);
 }
 
 // Drift check: re-render from the catalog + capabilities.md and compare against the
