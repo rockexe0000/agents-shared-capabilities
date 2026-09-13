@@ -205,9 +205,19 @@ function capFileArg() {
   return ci >= 0 ? process.argv[ci + 1] : path.join(HOME, 'personal', 'capabilities.md');
 }
 
+// --pipeline-bin <name>[,<name>]: extra bin tools to bake into bin-install.tsv beyond
+// what skills require — apply-pipeline deps (e.g. jq for perms-apply on a no-JSON-tool
+// image). Repeatable and/or comma-separated. Must be honored identically by --render
+// and --check so committed artifacts don't drift.
+function pipelineBinArg() {
+  const out = [];
+  process.argv.forEach((a, i) => { if (a === '--pipeline-bin' && process.argv[i + 1]) out.push(process.argv[i + 1]); });
+  return [...new Set(out.flatMap((s) => s.split(',').map((x) => x.trim()).filter(Boolean)))];
+}
+
 // Build the two rendered artifacts (as pretty JSON text) from a capabilities.md.
 // Shared by --render (write) and --check (compare) so both see identical output.
-function buildArtifacts(capFile) {
+function buildArtifacts(capFile, pipelineTools = []) {
   // personal base from the capabilities file: agent-bot/{uid}/personal/capabilities.md → agent-bot/{uid}
   let base = null;
   try { base = path.dirname(path.dirname(fs.realpathSync(capFile))); } catch (_) {}
@@ -229,8 +239,11 @@ function buildArtifacts(capFile) {
   // bin-install.tsv (ADR 0006 Phase D): one row per (tool, platform) the pod may
   // run on — name<TAB>os-arch<TAB>url<TAB>sha256<TAB>archive<TAB>bin. The pod picks
   // its own os-arch.
+  // bin list = tools enabled skills `require` ∪ apply-pipeline tools (--pipeline-bin,
+  // e.g. jq for perms-apply on a no-node/no-python image — not a skill require).
   const binTools = loadBinTools(REPO, base);
-  const binList = requiredToolNames(enable, REPO, base).map((n) => binTools.get(n)).filter(Boolean)
+  const binNames = [...new Set([...requiredToolNames(enable, REPO, base), ...pipelineTools])];
+  const binList = binNames.map((n) => binTools.get(n)).filter(Boolean)
     .sort((a, b) => a.name.localeCompare(b.name));
   const binTsv = binInstallTsv(binList);
   // skills bundle (ADR 0002 pod-projection gap): a deterministic tar of the enabled
@@ -346,7 +359,7 @@ function render() {
     process.exit(1);
   }
   const capFile = capFileArg();
-  const { facade, direct, binList, skillNames, authz, files } = buildArtifacts(capFile);
+  const { facade, direct, binList, skillNames, authz, files } = buildArtifacts(capFile, pipelineBinArg());
   fs.mkdirSync(outDir, { recursive: true });
   for (const [name, text] of Object.entries(files)) fs.writeFileSync(path.join(outDir, name), text);
   console.log(`rendered openab-agent-mcp.json (facade: ${facade.map((s) => s.name).join(', ') || 'none'})`);
@@ -365,7 +378,7 @@ function check() {
     console.error('usage: node sync.js --check <committed-artifacts-dir> [--capabilities <capabilities.md>]');
     process.exit(1);
   }
-  const { files } = buildArtifacts(capFileArg());
+  const { files } = buildArtifacts(capFileArg(), pipelineBinArg());
   let drift = false;
   for (const [name, want] of Object.entries(files)) {
     const committed = path.join(dir, name);
