@@ -139,6 +139,52 @@ function parseEnable(file) {
 }
 
 /**
+ * Parse a personal permissions.md (ADR 0007) enough to drive authorization
+ * projection. Returns { flag, allow:[], deny:[], ask:[] } where:
+ *   - flag: `authorize_skill_requires` top-level scalar, 'auto' | 'explicit'
+ *     (default 'explicit' — secure by default; only 'auto' derives grants from
+ *     enabled skills' `requires`).
+ *   - allow/deny/ask: the COMMAND names carried by rules whose `operation` is the
+ *     canonical `run command` token; `scope` holds the command (e.g. cfdrop).
+ * Non-command rules (push branches, deploy, …) are ignored here — this parser
+ * only extracts the runtime execution-authorization axis. Body is frontmatter-
+ * stripped YAML-ish (same controlled shape as the other parsers in this file).
+ */
+const CMD_OPERATION = 'run command'; // canonical operation token for a command grant
+function parsePermissions(text) {
+  const body = String(text).replace(/^---\n[\s\S]*?\n---/, '');
+  const out = { flag: 'explicit', allow: [], deny: [], ask: [] };
+  let inRules = false;
+  let cur = null; // { effect, operation, scope }
+  const flush = () => {
+    if (cur && cur.effect && strip(cur.operation) === CMD_OPERATION && cur.scope) {
+      const bucket = out[cur.effect];
+      if (Array.isArray(bucket) && !bucket.includes(cur.scope)) bucket.push(cur.scope);
+    }
+    cur = null;
+  };
+  for (const raw of body.split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const t = line.trim();
+    // top-level flag
+    const flag = t.match(/^authorize_skill_requires:\s*(auto|explicit)\b/);
+    if (flag && !inRules) { out.flag = flag[1]; continue; }
+    if (/^rules:\s*$/.test(t)) { flush(); inRules = true; continue; }
+    if (!inRules) continue;
+    const item = t.match(/^-\s*effect:\s*(.+)$/);
+    if (item) { flush(); cur = { effect: strip(item[1]), operation: null, scope: null }; continue; }
+    if (!cur) continue;
+    const op = t.match(/^operation:\s*(.+)$/);
+    if (op) { cur.operation = op[1]; continue; }
+    const sc = t.match(/^scope:\s*(.+)$/);
+    if (sc) { cur.scope = strip(sc[1]); continue; }
+  }
+  flush();
+  return out;
+}
+
+/**
  * Parse hooks/registry.yaml -> [{name, event, matcher, command, description,
  * source, 'pinned-ref', checksum}]. Flat shape (2-space indent items, 4-space
  * props), plus a nested `capability:` map for the description. `event` is a
@@ -308,4 +354,4 @@ function resolveServer(s, env) {
   return { server: out, unresolved };
 }
 
-module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, frontmatterBlock, parseRequires, loadDotenv, resolveRef, resolveServer };
+module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, parsePermissions, frontmatterBlock, parseRequires, loadDotenv, resolveRef, resolveServer };
