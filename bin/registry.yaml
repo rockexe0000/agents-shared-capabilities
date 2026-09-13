@@ -27,3 +27,24 @@ tools:
       macos-arm64:
         asset: cfdrop-macos-arm64.tar.gz
         sha256: 833e61af476b1148533dba82d182f61349a322940cb2668d128ec878bef93b07
+  # ── jq:apply-pipeline 依賴(非 skill require)。no-node/no-python image 上,perms-apply
+  # 的 JSON merge 需要它(ADR 0007;antigravity debian image 三工具全缺,先前 perms-apply 直接 SKIP)。
+  # 由 overlay 以 `sync --render --pipeline-bin jq` 顯性納入該 pod 的 bin-install.tsv,bin-apply 於
+  # perms-apply 之前裝好。sha256 對得上上游 jq-1.7.1 sha256sum.txt(已驗)。──
+  - name: jq
+    source: external:github.com/jqlang/jq
+    pinned-version: "1.7.1"       # jq-1.7.1;釘版本,不 live-link latest
+    provenance: none             # 上游 release 附 sha256sum.txt(已對);無 attestation → 顯性降級
+    bin: jq                      # 單檔可執行(raw)
+    archive: raw                # 下載物即 binary 本體(非壓縮檔)
+    url: "https://github.com/jqlang/jq/releases/download/jq-${version}/${asset}"
+    platforms:
+      linux-amd64:
+        asset: jq-linux-amd64
+        sha256: 5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5
+      linux-arm64:
+        asset: jq-linux-arm64
+        sha256: 4dd2d8a0661df0b22f1bb9a1f9830f06b6f3b8f7d91211a1ef5d7c4f06a8b4a5
+      macos-arm64:
+        asset: jq-macos-arm64
+        sha256: 0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a
