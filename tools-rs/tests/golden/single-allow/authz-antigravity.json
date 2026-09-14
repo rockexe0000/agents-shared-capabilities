@@ -1,0 +1,6 @@
+{
+  "allow": [
+    "command(cfdrop)"
+  ],
+  "deny": []
+}

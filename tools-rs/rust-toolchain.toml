@@ -1,0 +1,7 @@
+# Phase 0 toolchain pin (ADR 0008 Decision 2 — the binary is a managed supply-chain
+# object; its build must be reproducible). Pin the channel; CI/release will pin the
+# exact version + cross-compile targets (linux amd64/arm64 + macos) when Phase 1 wires
+# attest + sha256 pinning.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

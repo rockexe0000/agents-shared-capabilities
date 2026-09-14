@@ -1,0 +1,7 @@
+{
+  "allow": [
+    "Bash(aardvark:*)",
+    "Bash(git status:*)"
+  ],
+  "deny": []
+}

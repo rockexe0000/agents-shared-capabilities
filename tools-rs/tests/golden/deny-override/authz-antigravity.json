@@ -1,0 +1,8 @@
+{
+  "allow": [
+    "command(alpha)"
+  ],
+  "deny": [
+    "command(zebra)"
+  ]
+}
