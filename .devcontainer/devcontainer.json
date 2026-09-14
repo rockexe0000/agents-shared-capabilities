@@ -1,0 +1,25 @@
+{
+  "name": "agents-shared-capabilities",
+  // Rust base image ships build-essential (cc/linker) + git, so `cargo build`/`test`
+  // for tools-rs/ work out of the box. The Node feature adds the runtime tools/ needs.
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    // tools/ (sync.js, lint.js) run on Node; CI (.github/workflows/lint.yml) pins 20.
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    // gh for opening PRs from inside the container.
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  // jq: the no-node pod apply path (templates/pod-apply/perms-apply.sh) needs a JSON
+  // tool; install it so that path is testable locally. rustfmt/clippy back the
+  // tools-rs parity gate (cargo fmt --check / clippy -D warnings).
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y --no-install-recommends jq && rustup component add rustfmt clippy && node --version && cargo --version && jq --version",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint"
+      ]
+    }
+  }
+}
