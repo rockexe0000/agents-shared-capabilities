@@ -1,0 +1,17 @@
+# fixture personal bin registry — unique name so bin-install.tsv is catalog-independent.
+# fake url/sha256 (never fetched at render time; render only emits the manifest rows).
+tools:
+  - name: demotool
+    source: external:example
+    provenance: none
+    bin: demotool
+    archive: tar.gz
+    pinned-version: v1.2.3
+    url: "https://example.com/demotool/${version}/${asset}"
+    platforms:
+      linux-arm64:
+        asset: demotool-linux-arm64.tar.gz
+        sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      linux-amd64:
+        asset: demotool-linux-amd64.tar.gz
+        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

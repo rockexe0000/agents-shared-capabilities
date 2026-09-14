@@ -1,29 +1,22 @@
-//! capsync — ADR 0008 Phase 0 spike + Phase 1a (MCP render axis).
+//! capsync — ADR 0008 `--render` port (Phase 0 authz + Phase 1a MCP + Phase 1b bin).
 //!
-//! A single-file, runtime-portable reimplementation of the capability tooling's
-//! `--render`, scoped for this spike to the **authorization axis** (閘 2, ADR 0007):
+//! A single-file, runtime-portable reimplementation of the capability tooling's `--render`.
+//! Goal: **byte-for-byte parity** with `tools/sync.js --render`, mirroring `tools/lib/parse.js`,
+//! `tools/lib/authz.js`, `tools/lib/install-bin.js`, and `tools/projectors/oab-facade.js`.
+//! All JSON is emitted as `JSON.stringify(obj, null, 2) + "\n"`.
 //!
-//!   parse permissions.md  →  runtime-agnostic {allow, deny}  →  per-runtime tokens
-//!   →  emit authz-<runtime>.json
+//! Axes covered so far (parity-gated by the tests + parity.sh three-way diff):
+//!   - authz (ADR 0007): permissions.md → {allow, deny} per runtime → authz-<runtime>.json,
+//!     plus authz-suggest.txt and `authorize_skill_requires: auto` (requires-derived allows).
+//!   - MCP (Phase 1a): openab-agent-mcp.json (facade) + runtime-mcp.json (direct).
+//!   - bin (Phase 1b): bin-install.tsv from enabled skills' `requires` (∪ --pipeline-bin).
 //!
-//! Goal: **byte-for-byte parity** with `tools/sync.js --render`'s
-//! `authz-antigravity.json` and `authz-claude-code.json`. Every behaviour below is a
-//! deliberate mirror of `tools/lib/parse.js` (`parsePermissions`, `strip`,
-//! `stripComment`) and `tools/lib/authz.js` (`buildAuthz`, `mapAuthz`), including the
-//! JSON is emitted as `JSON.stringify(obj, null, 2) + "\n"`.
-//!
-//! SPIKE SCOPE (intentionally NOT full parity — see the ADR 0008 handoff Phase 1):
-//!   - Only the two authz JSON files. `authz-suggest.txt` and `authorize_skill_requires:
-//!     auto` derive allows from enabled skills' `requires`, which needs the enable-list +
-//!     bin-tools registry (loadBinTools / requiredToolNames). That surface lands in
-//!     Phase 1; here `auto` is parsed and honored for the flag, but no suggestions are
-//!     synthesized (documented gap, asserted by the parity harness which only exercises
-//!     explicit-mode fixtures for the JSON files).
-//!   - MCP axis (openab-agent-mcp.json / runtime-mcp.json) added in Phase 1a; bin /
-//!     skills / hooks / --check / --with-tools remain for later Phase 1 slices.
+//! Not yet ported (later Phase 1 slices): live `sync` projection (skills symlink / MCP merge /
+//! hooks), `--check`, `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,58 +52,62 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     };
 
-    // Mirror buildArtifacts(): permissions.md sits beside the capabilities file.
+    // Shared inputs (mirror buildArtifacts): catalog (REPO) root, the agent's personal
+    // namespace base, and the enable-list. permissions.md sits beside capabilities.md.
+    let catalog = resolve_catalog(args);
+    let base = personal_base(&cap_file);
+    let enable = parse_enable(&cap_file);
     let perms_file = cap_file
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("permissions.md");
     let perms_text = std::fs::read_to_string(&perms_file).unwrap_or_default();
 
-    let authz = build_authz(&perms_text);
-
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {out_dir}: {e}"))?;
+    let out = Path::new(&out_dir);
+
+    // ---- authz axis (ADR 0007; auto mode + authz-suggest.txt completed in Phase 1b) ----
+    let authz = build_authz(&perms_text, &enable, catalog.as_deref(), base.as_deref());
     for rt in AUTHZ_RUNTIMES {
         let mapped = map_authz(rt, &authz);
-        let text = stringify_authz(&mapped);
-        let path = Path::new(&out_dir).join(format!("authz-{}.json", rt.id));
-        std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let path = out.join(format!("authz-{}.json", rt.id));
+        std::fs::write(&path, stringify_authz(&mapped))
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
     }
-    println!(
-        "rendered authz-*.json (mode {}; allow: {}; deny: {}) -> {}",
-        authz.flag,
-        if authz.allow.is_empty() {
-            "none".into()
-        } else {
-            authz.allow.join(", ")
-        },
-        if authz.deny.is_empty() {
-            "none".into()
-        } else {
-            authz.deny.join(", ")
-        },
-        out_dir,
-    );
+    std::fs::write(out.join("authz-suggest.txt"), suggest_text(&authz))
+        .map_err(|e| format!("write authz-suggest.txt: {e}"))?;
 
-    // ---- MCP axis (ADR 0008 Phase 1a) — port of sync.js buildArtifacts() MCP path ----
-    // registry = catalog ∪ personal (personal overrides on name collision); split the
-    // enabled servers by route (default facade), shape each via oab-facade shapeServer,
-    // emit { mcpServers: {...} } as JSON.stringify(_, null, 2)+"\n". Render does NOT
-    // resolve secrets — both routes go through shapeServer, which rewrites env:VAR ->
-    // ${env:VAR}. Catalog root comes from --catalog (see resolve_catalog).
-    let catalog = resolve_catalog(args);
-    let base = personal_base(&cap_file);
+    // ---- bin axis (ADR 0006 Phase D) — bin-install.tsv: one row per (tool, platform) the
+    // enabled skills `require` (∪ --pipeline-bin), for the pod's no-node bin-apply.sh. ----
+    let bin_tools = load_bin_tools(catalog.as_deref(), base.as_deref());
+    let pipeline = pipeline_bin_arg(args);
+    let bin_list = bin_list(
+        &enable,
+        &bin_tools,
+        catalog.as_deref(),
+        base.as_deref(),
+        &pipeline,
+    );
+    std::fs::write(out.join("bin-install.tsv"), bin_install_tsv(&bin_list))
+        .map_err(|e| format!("write bin-install.tsv: {e}"))?;
+
+    // ---- MCP axis (ADR 0008 Phase 1a) — openab-agent-mcp.json (facade) + runtime-mcp.json
+    // (direct). Render does NOT resolve secrets: both routes go through shapeServer, which
+    // rewrites env:VAR -> ${env:VAR}. ----
     let registry = build_registry(catalog.as_deref(), base.as_deref());
-    let enable = parse_enable(&cap_file);
     let (facade, direct) = split_mcp_routes(&enable, &registry);
-    let out = Path::new(&out_dir);
     std::fs::write(out.join("openab-agent-mcp.json"), as_cfg(&facade))
         .map_err(|e| format!("write openab-agent-mcp.json: {e}"))?;
     std::fs::write(out.join("runtime-mcp.json"), as_cfg(&direct))
         .map_err(|e| format!("write runtime-mcp.json: {e}"))?;
+
     println!(
-        "rendered openab-agent-mcp.json (facade: {}) / runtime-mcp.json (direct: {})",
+        "rendered authz-*.json (mode {}) + bin-install.tsv ({} tool(s)) + mcp (facade: {} / direct: {}) -> {}",
+        authz.flag,
+        bin_list.len(),
         names(&facade),
         names(&direct),
+        out_dir,
     );
     Ok(())
 }
@@ -311,29 +308,48 @@ fn trim_end(s: &str) -> &str {
 // authz build/map — port of tools/lib/authz.js buildAuthz/mapAuthz.
 // ----------------------------------------------------------------------------
 
+struct Suggestion {
+    tool: String,
+    command: String,
+}
+
 struct Authz {
     flag: String,
     allow: Vec<String>, // sorted, deny-subtracted
     deny: Vec<String>,  // sorted
+    suggestions: Vec<Suggestion>,
 }
 
-/// Port of buildAuthz for the spike's explicit-mode scope. In `auto` mode the JS adds
-/// `requires`-derived commands to allow; that derivation (enable-list + bin tools) is
-/// Phase 1 (see module docs), so here allow/deny come solely from permissions.md.
-fn build_authz(perms_text: &str) -> Authz {
+/// Port of buildAuthz (ADR 0007). explicit mode: allow = permissions.md `allow` minus deny.
+/// auto mode (`authorize_skill_requires: auto`): additionally allow the commands the enabled
+/// skills' `requires` resolve to. deny always wins. `suggestions` is the requires-derived hint
+/// list (used by suggest_text → authz-suggest.txt), sorted by command.
+fn build_authz(
+    perms_text: &str,
+    enable: &Enable,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+) -> Authz {
     let perms = parse_permissions(perms_text);
-    let deny: BTreeSet<String> = js_sorted_set(&perms.deny);
-    // allow = set(perms.allow) minus deny, then JS-sorted.
-    let allow_set: BTreeSet<String> = perms
-        .allow
-        .iter()
-        .filter(|c| !deny.contains(*c))
-        .cloned()
-        .collect();
+    let suggestions = required_commands(enable, catalog, base);
+    let deny: BTreeSet<String> = perms.deny.iter().cloned().collect();
+    let mut allow_set: BTreeSet<String> = perms.allow.iter().cloned().collect();
+    if perms.flag == "auto" {
+        for s in &suggestions {
+            allow_set.insert(s.command.clone());
+        }
+    }
+    let allow: Vec<String> = js_sort(
+        allow_set
+            .into_iter()
+            .filter(|c| !deny.contains(c))
+            .collect(),
+    );
     Authz {
         flag: perms.flag,
-        allow: js_sort(allow_set.into_iter().collect()),
+        allow,
         deny: js_sort(deny.into_iter().collect()),
+        suggestions,
     }
 }
 
@@ -379,13 +395,6 @@ fn map_authz(rt: &Runtime, a: &Authz) -> Mapped {
 fn js_sort(mut v: Vec<String>) -> Vec<String> {
     v.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
     v
-}
-
-/// Dedup helper preserving the JS "Set then sort" semantics via a BTreeSet is not
-/// order-safe for UTF-16, so we only use BTreeSet for membership; final order comes from
-/// js_sort. This just builds the membership set.
-fn js_sorted_set(v: &[String]) -> BTreeSet<String> {
-    v.iter().cloned().collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -670,11 +679,17 @@ fn parse_args(val: &str) -> Json {
     parse_json(s.trim()).unwrap_or_else(|_| Json::Arr(Vec::new()))
 }
 
-/// Enabled MCP set from capabilities.md (Phase 1a needs only the MCP axis; skills/hooks
-/// land with their own slices). Mirrors parse.js parseEnable's `mcp.servers` handling.
+/// Enabled subset from capabilities.md. Phase 1a used only `mcp`; Phase 1b adds `skills`
+/// (name + source) for the bin `requires` closure. hooks land with their own slice.
+/// Mirrors parse.js parseEnable's `skills:` and `mcp.servers` handling.
 #[derive(Default)]
 struct Enable {
+    skills: Vec<EnableSkill>,
     mcp: Vec<EnableMcp>,
+}
+struct EnableSkill {
+    name: String,
+    source: String, // "catalog" | "personal"
 }
 struct EnableMcp {
     name: String,
@@ -699,19 +714,61 @@ fn parse_enable(file: &Path) -> Enable {
             mcp_servers = false;
             continue;
         }
-        if top.as_deref() == Some("mcp") {
-            if is_servers_line(raw) {
-                mcp_servers = true;
-                continue;
-            }
-            if mcp_servers {
-                if let Some(name) = match_dash_name(raw) {
-                    out.mcp.push(EnableMcp { name });
+        match top.as_deref() {
+            Some("skills") => {
+                if let Some(name) = match_skill_name(raw) {
+                    out.skills.push(EnableSkill {
+                        name,
+                        source: "catalog".to_string(),
+                    });
+                } else if let Some(src) = match_source(raw) {
+                    if let Some(last) = out.skills.last_mut() {
+                        last.source = src;
+                    }
                 }
             }
+            Some("mcp") => {
+                if is_servers_line(raw) {
+                    mcp_servers = true;
+                } else if mcp_servers {
+                    if let Some(name) = match_dash_name(raw) {
+                        out.mcp.push(EnableMcp { name });
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
+}
+
+/// JS: raw.match(/^\s*-\s*name:\s*(\S[^\n]*?)\s*$/) group 1 — skill item name (block form;
+/// value is the trimmed remainder, which may contain spaces, unlike the MCP `name` token).
+fn match_skill_name(raw: &str) -> Option<String> {
+    let r = raw.trim_start();
+    let r = r.strip_prefix('-')?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix("name:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let v = r.trim_end();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// JS: raw.match(/^\s*source:\s*(\S+)/) group 1.
+fn match_source(raw: &str) -> Option<String> {
+    let r = raw.trim_start();
+    let r = r.strip_prefix("source:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let v: String = r.chars().take_while(|c| !c.is_whitespace()).collect();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// JS: raw.match(/^(\w[\w-]*):\s*$/) group 1 — a top-level key at column 0 (no indent).
@@ -1006,6 +1063,383 @@ fn parse_object(c: &[char], pos: &mut usize) -> Result<Json, ()> {
     }
 }
 
+// ============================================================================
+// bin axis + requires closure (ADR 0008 Phase 1b) — port of parse.js parseBinRegistry /
+// parseRequires / frontmatterBlock, install-bin.js loadBinTools / requiredToolNames, and
+// sync.js binInstallTsv / pipelineBinArg. Drives both bin-install.tsv and (via
+// required_commands) authz auto mode + authz-suggest.txt.
+// ============================================================================
+
+#[derive(Clone, Default)]
+struct Platform {
+    asset: Option<String>,
+    sha256: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct BinTool {
+    name: String,
+    bin: Option<String>,
+    archive: Option<String>,
+    url: Option<String>,
+    pinned_version: Option<String>,
+    platforms: Vec<(String, Platform)>, // insertion order; TSV re-sorts keys
+}
+
+/// Port of parse.js parseBinRegistry: `- name:` items (indent <= 2), 4-space scalar props,
+/// a nested `platforms:` map (keys at indent 6, `asset`/`sha256` at indent >= 8).
+fn parse_bin_registry(text: &str) -> Vec<BinTool> {
+    let mut tools: Vec<BinTool> = Vec::new();
+    let mut in_platforms = false;
+    let mut plat: Option<String> = None;
+    for raw in text.split('\n') {
+        let line = trim_end(raw);
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= 2 {
+            if let Some(name) = match_item_name(t) {
+                tools.push(BinTool {
+                    name: strip(&name),
+                    ..Default::default()
+                });
+                in_platforms = false;
+                plat = None;
+                continue;
+            }
+        }
+        let cur = match tools.last_mut() {
+            Some(c) => c,
+            None => continue,
+        };
+        if indent == 4 && t == "platforms:" {
+            in_platforms = true;
+            plat = None;
+            continue;
+        }
+        if in_platforms && indent == 6 {
+            if let Some(k) = match_opener(t) {
+                cur.platforms.push((k.clone(), Platform::default()));
+                plat = Some(k);
+                continue;
+            }
+        }
+        if in_platforms && indent >= 8 {
+            if let Some(p) = &plat {
+                if let Some((key, val)) = match_kv(t) {
+                    if let Some(entry) = cur.platforms.iter_mut().find(|(pk, _)| pk == p) {
+                        match key.as_str() {
+                            "asset" => entry.1.asset = Some(strip(&val)),
+                            "sha256" => entry.1.sha256 = Some(strip(&val)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if indent <= 4 {
+            in_platforms = false;
+            plat = None;
+            if let Some((key, val)) = match_kv(t) {
+                match key.as_str() {
+                    "bin" => cur.bin = Some(strip(&val)),
+                    "archive" => cur.archive = Some(strip(&val)),
+                    "url" => cur.url = Some(strip(&val)),
+                    "pinned-version" => cur.pinned_version = Some(strip(&val)),
+                    _ => {} // name (dupe), source, provenance, … don't affect the TSV
+                }
+            }
+        }
+    }
+    tools
+}
+
+fn load_bin_registry(dir: &Path) -> Vec<BinTool> {
+    let f = dir.join("bin").join("registry.yaml");
+    match std::fs::read_to_string(&f) {
+        Ok(text) => parse_bin_registry(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// JS loadBinTools: catalog then personal (personal overrides on name collision).
+fn load_bin_tools(catalog: Option<&Path>, base: Option<&Path>) -> HashMap<String, BinTool> {
+    let mut map: HashMap<String, BinTool> = HashMap::new();
+    if let Some(c) = catalog {
+        for t in load_bin_registry(c) {
+            map.insert(t.name.clone(), t);
+        }
+    }
+    if let Some(b) = base {
+        for t in load_bin_registry(b) {
+            map.insert(t.name.clone(), t);
+        }
+    }
+    map
+}
+
+/// JS: text.match(/^---\n([\s\S]*?)\n---/) group 1 — the leading frontmatter block ('' if none).
+fn frontmatter_block(text: &str) -> String {
+    if let Some(after) = text.strip_prefix("---\n") {
+        if let Some(pos) = after.find("\n---") {
+            return after[..pos].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Port of parse.js parseRequires, names only (min is unused by render). Block form
+/// (`requires:` then `- name:` items) or inline (`requires: [ {name: x}, … ]`).
+fn parse_requires_names(fm: &str) -> Vec<String> {
+    let lines: Vec<&str> = fm.split('\n').collect();
+    let idx = lines.iter().position(|l| is_requires_line(l));
+    match idx {
+        None => {
+            for l in &lines {
+                if let Some(inner) = match_inline_requires(l) {
+                    return extract_inline_names(&inner);
+                }
+            }
+            Vec::new()
+        }
+        Some(i) => {
+            let mut out = Vec::new();
+            for l in &lines[i + 1..] {
+                if let Some(name) = match_block_require_name(l) {
+                    out.push(name);
+                    continue;
+                }
+                if l.trim_start().starts_with("min:") {
+                    continue; // min line — indented, ignored for names
+                }
+                if l.chars().next().is_some_and(|c| !c.is_whitespace()) {
+                    break; // dedent to the next top-level key
+                }
+            }
+            out
+        }
+    }
+}
+
+/// JS: /^requires:\s*(#.*)?$/ — a bare `requires:` line (optional trailing comment).
+fn is_requires_line(l: &str) -> bool {
+    match l.strip_prefix("requires:") {
+        Some(rest) => {
+            let rest = rest.trim_start_matches([' ', '\t']);
+            rest.is_empty() || rest.starts_with('#')
+        }
+        None => false,
+    }
+}
+
+/// JS: /^requires:\s*\[(.+)\]\s*$/ — the inner text of an inline `requires: [ … ]`.
+fn match_inline_requires(l: &str) -> Option<String> {
+    let r = l.strip_prefix("requires:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix('[')?;
+    let end = r.rfind(']')?;
+    let after = &r[end + 1..];
+    if after.trim_start_matches([' ', '\t']).is_empty() {
+        Some(r[..end].to_string())
+    } else {
+        None
+    }
+}
+
+/// JS global /name:\s*([A-Za-z0-9_-]+)/g over an inline requires body.
+fn extract_inline_names(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = inner;
+    while let Some(p) = rest.find("name:") {
+        let after = rest[p + "name:".len()..].trim_start_matches([' ', '\t']);
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            out.push(name);
+        }
+        rest = &rest[p + "name:".len()..];
+    }
+    out
+}
+
+/// JS: /^\s*-\s*name:\s*([A-Za-z0-9_-]+)/ group 1 (a block requires item).
+fn match_block_require_name(l: &str) -> Option<String> {
+    let r = l.trim_start();
+    let r = r.strip_prefix('-')?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix("name:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let name: String = r
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// JS requiredToolNames: enabled skills' SKILL.md `requires` names, de-duped, first-seen order.
+fn required_tool_names(
+    enable: &Enable,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = HashSet::new();
+    for s in &enable.skills {
+        let dir = match (s.source.as_str(), base) {
+            ("personal", Some(b)) => b.join("skills").join(&s.name),
+            _ => match catalog {
+                Some(c) => c.join("skills").join(&s.name),
+                None => continue,
+            },
+        };
+        let text = match std::fs::read_to_string(dir.join("SKILL.md")) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for name in parse_requires_names(&frontmatter_block(&text)) {
+            if seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// JS requiredCommands: each required tool name → {tool, command=bin||name}, sorted by command.
+/// localeCompare is approximated by scalar order (equal for lowercase-ascii command names;
+/// the parity gate catches any divergence).
+fn required_commands(
+    enable: &Enable,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+) -> Vec<Suggestion> {
+    let tools = load_bin_tools(catalog, base);
+    let mut sug: Vec<Suggestion> = required_tool_names(enable, catalog, base)
+        .into_iter()
+        .map(|name| {
+            let command = tools
+                .get(&name)
+                .and_then(|t| t.bin.clone())
+                .unwrap_or_else(|| name.clone());
+            Suggestion {
+                tool: name,
+                command,
+            }
+        })
+        .collect();
+    sug.sort_by(|a, b| a.command.cmp(&b.command));
+    sug
+}
+
+/// JS suggestText: the requires-derived copy-paste hint, deterministic for --check.
+fn suggest_text(a: &Authz) -> String {
+    let mut lines = vec![format!("# authorize_skill_requires: {}", a.flag)];
+    if a.suggestions.is_empty() {
+        lines.push("# (no enabled skill declares a `requires` command)".to_string());
+    } else {
+        lines.push(
+            "# commands enabled skills require (paste an allow rule into permissions.md to grant):"
+                .to_string(),
+        );
+        for s in &a.suggestions {
+            let granted = if a.allow.contains(&s.command) {
+                "  [granted]"
+            } else {
+                ""
+            };
+            lines.push(format!("#   {}  (from {}){}", s.command, s.tool, granted));
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// JS pipelineBinArg: repeatable/comma-separated `--pipeline-bin` values, de-duped in order.
+fn pipeline_bin_arg(args: &[String]) -> Vec<String> {
+    let mut raw = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == "--pipeline-bin" {
+            if let Some(v) = args.get(i + 1) {
+                raw.push(v.clone());
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for s in raw {
+        for part in s.split(',') {
+            let p = part.trim();
+            if !p.is_empty() && seen.insert(p.to_string()) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// JS buildArtifacts bin list: (requiredToolNames ∪ pipelineTools) resolved to tools, filtered
+/// to known ones, sorted by name.
+fn bin_list<'a>(
+    enable: &Enable,
+    bin_tools: &'a HashMap<String, BinTool>,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+    pipeline: &[String],
+) -> Vec<&'a BinTool> {
+    let mut names = required_tool_names(enable, catalog, base);
+    names.extend(pipeline.iter().cloned());
+    let mut seen = HashSet::new();
+    let mut list: Vec<&BinTool> = names
+        .into_iter()
+        .filter(|n| seen.insert(n.clone()))
+        .filter_map(|n| bin_tools.get(&n))
+        .collect();
+    list.sort_by(|a, b| a.name.cmp(&b.name));
+    list
+}
+
+/// JS binInstallTsv: name<TAB>os-arch<TAB>url<TAB>sha256<TAB>archive<TAB>bin, one row per
+/// (tool, platform). Platform keys sorted (JS default sort = UTF-16). Empty -> "".
+fn bin_install_tsv(tools: &[&BinTool]) -> String {
+    let mut rows = Vec::new();
+    for t in tools {
+        let bin = t.bin.clone().unwrap_or_else(|| t.name.clone());
+        let archive = t.archive.clone().unwrap_or_else(|| "tar.gz".to_string());
+        let pv = t.pinned_version.clone().unwrap_or_default();
+        let url_tpl = t.url.clone().unwrap_or_default();
+        let mut plats: Vec<&(String, Platform)> = t.platforms.iter().collect();
+        plats.sort_by(|a, b| a.0.encode_utf16().cmp(b.0.encode_utf16()));
+        for (plat, spec) in plats {
+            let asset = spec.asset.clone().unwrap_or_default();
+            let url = url_tpl
+                .replace("${version}", &pv)
+                .replace("${asset}", &asset);
+            let sha = spec.sha256.clone().unwrap_or_default();
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                t.name, plat, url, sha, archive, bin
+            ));
+        }
+    }
+    if rows.is_empty() {
+        String::new()
+    } else {
+        let mut s = rows.join("\n");
+        s.push('\n');
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1049,7 +1483,7 @@ rules:
     operation: \"push branches + open PRs\"
     scope: \"repo x\"
 ";
-        let a = build_authz(text);
+        let a = build_authz(text, &Enable::default(), None, None);
         assert_eq!(a.flag, "explicit");
         assert_eq!(a.allow, vec!["cfdrop"]); // ripgrep removed by deny; push rule ignored
         assert_eq!(a.deny, vec!["ripgrep"]);
@@ -1069,7 +1503,7 @@ rules:
     operation: run command
     scope: alpha
 ";
-        let a = build_authz(text);
+        let a = build_authz(text, &Enable::default(), None, None);
         assert_eq!(a.allow, vec!["alpha", "zebra"]);
         assert_eq!(a.flag, "explicit"); // default when flag line absent
     }
@@ -1092,6 +1526,7 @@ rules:
             flag: "explicit".into(),
             allow: vec!["cfdrop".into()],
             deny: vec![],
+            suggestions: Vec::new(),
         };
         let agy = map_authz(&AUTHZ_RUNTIMES[0], &a);
         let cc = map_authz(&AUTHZ_RUNTIMES[1], &a);
@@ -1140,6 +1575,7 @@ servers:
                     name: "test-http".into(),
                 },
             ],
+            ..Default::default()
         };
         let (facade, direct) = split_mcp_routes(&enable, &reg);
         // default route (facade) for the stdio server, explicit direct for the http one.
@@ -1190,5 +1626,93 @@ servers:
         let j = parse_json("[\"-y\", \"x\"]").unwrap();
         assert_eq!(stringify(&j, 0), "[\n  \"-y\",\n  \"x\"\n]");
         assert!(parse_json("nope").is_err());
+    }
+
+    const BIN_REG: &str = "\
+tools:
+  - name: demotool
+    source: external:example
+    pinned-version: v1.2.3
+    bin: demotool
+    archive: tar.gz
+    url: \"https://example.com/demotool/${version}/${asset}\"
+    platforms:
+      linux-arm64:
+        asset: demotool-linux-arm64.tar.gz
+        sha256: bbbb
+      linux-amd64:
+        asset: demotool-linux-amd64.tar.gz
+        sha256: aaaa
+";
+
+    #[test]
+    fn bin_registry_and_tsv() {
+        let tools = parse_bin_registry(BIN_REG);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "demotool");
+        assert_eq!(tools[0].platforms.len(), 2);
+        let refs: Vec<&BinTool> = tools.iter().collect();
+        // platform keys re-sorted (amd64 before arm64); ${version}/${asset} substituted.
+        assert_eq!(
+            bin_install_tsv(&refs),
+            "demotool\tlinux-amd64\thttps://example.com/demotool/v1.2.3/demotool-linux-amd64.tar.gz\taaaa\ttar.gz\tdemotool\n\
+             demotool\tlinux-arm64\thttps://example.com/demotool/v1.2.3/demotool-linux-arm64.tar.gz\tbbbb\ttar.gz\tdemotool\n"
+        );
+        assert_eq!(bin_install_tsv(&[]), "");
+    }
+
+    #[test]
+    fn requires_block_and_inline() {
+        let block =
+            "name: s\nrequires:\n  - name: cfdrop\n  - name: jq\n    min: \"1.7\"\nother: x\n";
+        assert_eq!(parse_requires_names(block), vec!["cfdrop", "jq"]);
+        let inline = "requires: [{ name: cfdrop }, { name: jq, min: 1.7 }]\n";
+        assert_eq!(parse_requires_names(inline), vec!["cfdrop", "jq"]);
+        assert_eq!(parse_requires_names("name: s\n"), Vec::<String>::new());
+        assert_eq!(
+            frontmatter_block("---\na: 1\nrequires:\n---\nbody"),
+            "a: 1\nrequires:"
+        );
+    }
+
+    #[test]
+    fn authz_auto_derives_from_suggestions() {
+        // auto mode: a requires-derived command becomes an allow; explicit does not.
+        let sug = vec![Suggestion {
+            tool: "demotool".into(),
+            command: "demotool".into(),
+        }];
+        let a_auto = Authz {
+            flag: "auto".into(),
+            allow: js_sort(vec!["demotool".into()]),
+            deny: vec![],
+            suggestions: sug,
+        };
+        assert!(a_auto.allow.contains(&"demotool".to_string()));
+        assert_eq!(
+            suggest_text(&a_auto),
+            "# authorize_skill_requires: auto\n\
+             # commands enabled skills require (paste an allow rule into permissions.md to grant):\n\
+             #   demotool  (from demotool)  [granted]\n"
+        );
+        let a_none = Authz {
+            flag: "explicit".into(),
+            allow: vec![],
+            deny: vec![],
+            suggestions: vec![],
+        };
+        assert_eq!(
+            suggest_text(&a_none),
+            "# authorize_skill_requires: explicit\n# (no enabled skill declares a `requires` command)\n"
+        );
+    }
+
+    #[test]
+    fn pipeline_bin_dedup() {
+        let args: Vec<String> = ["--pipeline-bin", "jq,ripgrep", "--pipeline-bin", "jq"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(pipeline_bin_arg(&args), vec!["jq", "ripgrep"]);
     }
 }
