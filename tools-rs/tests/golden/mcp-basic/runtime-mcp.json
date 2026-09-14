@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "test-http": {
+      "type": "http",
+      "url": "https://mcp.example.com/v1",
+      "headers": {
+        "Authorization": "${env:EXAMPLE_TOKEN}"
+      }
+    }
+  }
+}

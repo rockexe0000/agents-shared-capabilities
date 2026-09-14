@@ -1,0 +1,23 @@
+# fixture personal MCP registry — unique names so the render is independent of the real
+# catalog. Exercises: default route (facade) vs route: direct, stdio vs http shapeServer,
+# args JSON re-emit, and env:VAR -> ${env:VAR} rewriting in env + headers.
+servers:
+  - name: test-stdio
+    transport: stdio
+    command: npx
+    args: ["-y", "@example/mcp-server"]
+    env:
+      API_KEY: "env:EXAMPLE_API_KEY"
+      REGION: "us-east-1"
+    capability:
+      description: "fixture stdio server (facade route by default)"
+    source: "fixture"
+  - name: test-http
+    route: direct
+    transport: http
+    url: "https://mcp.example.com/v1"
+    headers:
+      Authorization: "env:EXAMPLE_TOKEN"
+    capability:
+      description: "fixture http server (direct route)"
+    source: "fixture"
