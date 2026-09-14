@@ -11,7 +11,7 @@ requires:                      # native binary deps → bin/registry.yaml (ADR 0
     min: "0.4.0"               # floor: mermaid rendering (syntax highlight ≥0.3.0, --md ≥0.2.0)
 source: external:github.com/oablab/cfdrop
 pinned-ref: 66a5877653f8e8290605457652fa628c71d7ee05
-checksum: sha256:83f2b5733db91876f90fbf0cadcccb1b8c472fcc419372d192b69840fcd68c1a   # sha256 of upstream skills/cfdrop/SKILL.md at pinned-ref (provenance anchor; this vendored copy adds only the catalog keys above)
+checksum: sha256:83f2b5733db91876f90fbf0cadcccb1b8c472fcc419372d192b69840fcd68c1a   # sha256 of upstream skills/cfdrop/SKILL.md at pinned-ref (provenance anchor; this vendored copy adds the catalog keys above + a local `~/tmp/` output-dir edit for sandboxed runtimes — see ADR discussion discord:1548114275158200351)
 ---
 
 # cfdrop — Explain Anything as a Mobile Site
@@ -20,13 +20,19 @@ Generate mobile-first static web assets that explain the requested subject, depl
 with the `cfdrop` CLI (self-contained Rust binary, no Cloudflare account needed), and
 return a live `workers.dev` URL. Sites live ~60 minutes unless claimed.
 
+**Working directory.** Put the analysis + site files under `~/tmp/` (i.e. `$HOME/tmp/…`) —
+**not a bare `/tmp`**. Sandboxed runtimes (e.g. Antigravity's `agy`) only permit file
+writes inside the agent's home/workspace and reject out-of-workspace paths like `/tmp`;
+`~` resolves to the writable home on every runtime, and the same absolute path is seen by
+both your file-writing tool and the `cfdrop` CLI, so writes and deploy always agree.
+
 ## Workflow
 
 1. **Understand the subject.** "Explain this" may point at code, issues, a document, a
    conversation topic. Gather what's needed (read files, fetch issues, run analysis).
    For many independent items needing deep analysis, fan out to subagents that each
-   write `/tmp/<slug>-analysis/<id>.json`.
-2. **Generate the site** into `/tmp/<slug>-site/` (slug = short kebab-case subject name).
+   write `~/tmp/<slug>-analysis/<id>.json`.
+2. **Generate the site** into `~/tmp/<slug>-site/` (slug = short kebab-case subject name).
 
    **Markdown path (prefer for prose-heavy subjects):** write `*.md` files into the
    directory and deploy with `--md` — cfdrop (≥0.2.0) converts them to mobile-first
@@ -48,7 +54,7 @@ return a live `workers.dev` URL. Sites live ~60 minutes unless claimed.
    - `<id>.html` — one page per item: header card with "← All items" back link and an
      outbound source link, then numbered sections (summary / current-vs-expected flow
      diagram / analysis / suggested action — adapt sections to the subject)
-3. **Deploy:** `cfdrop deploy --directory /tmp/<slug>-site --name <slug> -y`
+3. **Deploy:** `cfdrop deploy --directory ~/tmp/<slug>-site --name <slug> -y`
    - Add `--auth user:pass` if the user wants the site gated (HTTP Basic Auth)
    - `-y` is required non-interactively (accepts Cloudflare ToS)
 4. **Verify:** curl the index and one detail page, expect 200. An immediate curl can hit
