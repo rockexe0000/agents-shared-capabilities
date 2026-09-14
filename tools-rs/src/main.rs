@@ -1,4 +1,4 @@
-//! capsync — ADR 0008 `--render` port (Phase 0 authz + Phase 1a MCP + Phase 1b bin).
+//! capsync — ADR 0008 `--render` port (Phase 0 authz + 1a MCP + 1b bin + 1c skills).
 //!
 //! A single-file, runtime-portable reimplementation of the capability tooling's `--render`.
 //! Goal: **byte-for-byte parity** with `tools/sync.js --render`, mirroring `tools/lib/parse.js`,
@@ -10,15 +10,19 @@
 //!     plus authz-suggest.txt and `authorize_skill_requires: auto` (requires-derived allows).
 //!   - MCP (Phase 1a): openab-agent-mcp.json (facade) + runtime-mcp.json (direct).
 //!   - bin (Phase 1b): bin-install.tsv from enabled skills' `requires` (∪ --pipeline-bin).
+//!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
-//! Not yet ported (later Phase 1 slices): live `sync` projection (skills symlink / MCP merge /
-//! hooks), `--check`, `--with-tools` / `--check-tools`.
+//! This completes `--render`'s artifact set. Not yet ported (later Phase 1 slices): live
+//! `sync` projection (skills symlink / MCP merge / hooks), `--check`, `--with-tools` /
+//! `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,6 +94,15 @@ fn run(args: &[String]) -> Result<(), String> {
     );
     std::fs::write(out.join("bin-install.tsv"), bin_install_tsv(&bin_list))
         .map_err(|e| format!("write bin-install.tsv: {e}"))?;
+
+    // ---- skills axis (ADR 0002 pod-projection) — a deterministic tar of the enabled skills'
+    // dirs (base64'd for the text configMap) + skills.list for GC. Shells to the same `tar` as
+    // sync.js so the bytes match; staging modes mirror node (root 0700, dirs 0755, files kept). ----
+    let bundle = build_skills_bundle(&enable, catalog.as_deref(), base.as_deref());
+    std::fs::write(out.join("skills.tar.b64"), &bundle.tar_b64)
+        .map_err(|e| format!("write skills.tar.b64: {e}"))?;
+    std::fs::write(out.join("skills.list"), &bundle.list)
+        .map_err(|e| format!("write skills.list: {e}"))?;
 
     // ---- MCP axis (ADR 0008 Phase 1a) — openab-agent-mcp.json (facade) + runtime-mcp.json
     // (direct). Render does NOT resolve secrets: both routes go through shapeServer, which
@@ -1440,6 +1453,149 @@ fn bin_install_tsv(tools: &[&BinTool]) -> String {
     }
 }
 
+// ============================================================================
+// skills axis (ADR 0008 Phase 1c) — port of sync.js buildSkillsBundle: stage the enabled
+// skills' dirs (each rooted at <name>/), tar deterministically via the same `tar`, base64.
+// ============================================================================
+
+struct SkillsBundle {
+    tar_b64: String,
+    list: String,
+}
+
+/// Port of buildSkillsBundle. skills sorted by name; each staged under <name>/ then tarred
+/// with GNU tar's determinism flags and base64'd (+ "\n"). skills.list = sorted names.
+/// Empty enable set -> both "" (matches node). Staging modes mirror node so tar bytes match:
+/// root 0700 (mkdtemp), dirs 0755 (mkdir default), files keep their source mode.
+fn build_skills_bundle(
+    enable: &Enable,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+) -> SkillsBundle {
+    let empty = SkillsBundle {
+        tar_b64: String::new(),
+        list: String::new(),
+    };
+    let mut skills: Vec<&EnableSkill> = enable.skills.iter().collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name)); // localeCompare ≈ scalar order for skill names
+    let staged = match make_stage_dir() {
+        Some(d) => d,
+        None => return empty,
+    };
+    let mut names: Vec<String> = Vec::new();
+    for s in skills {
+        let dir = match (s.source.as_str(), base) {
+            ("personal", Some(b)) => b.join("skills").join(&s.name),
+            _ => match catalog {
+                Some(c) => c.join("skills").join(&s.name),
+                None => continue,
+            },
+        };
+        if !dir.exists() {
+            eprintln!(
+                "  skill {}: source missing ({}) — skipped",
+                s.name,
+                dir.display()
+            );
+            continue;
+        }
+        if copy_tree(&dir, &staged.join(&s.name)).is_ok() {
+            names.push(s.name.clone());
+        }
+    }
+    let tar_b64 = if names.is_empty() {
+        String::new()
+    } else {
+        match Command::new("tar")
+            .args([
+                "--sort=name",
+                "--mtime=UTC 2020-01-01",
+                "--owner=0",
+                "--group=0",
+                "--numeric-owner",
+                "-cf",
+                "-",
+                "-C",
+            ])
+            .arg(&staged)
+            .arg(".")
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let mut s = base64_encode(&o.stdout);
+                s.push('\n');
+                s
+            }
+            _ => String::new(),
+        }
+    };
+    let _ = std::fs::remove_dir_all(&staged);
+    let list = if names.is_empty() {
+        String::new()
+    } else {
+        let mut s = names.join("\n");
+        s.push('\n');
+        s
+    };
+    SkillsBundle { tar_b64, list }
+}
+
+/// A fresh staging dir at mode 0700 (mkdtemp equivalent — tar records the `./` root with this
+/// mode). Not cryptographically unique; pid+nanos suffices for a single render.
+fn make_stage_dir() -> Option<PathBuf> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("capsync-skills-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir(&dir).ok()?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
+}
+
+/// Recursive copy mirroring sync.js cpDir: dirs via create_dir_all (0755 under umask 022, ==
+/// node mkdirSync default), files via fs::copy (preserves source mode == node copyFileSync).
+fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let e = entry?;
+        let s = e.path();
+        let d = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_tree(&s, &d)?;
+        } else {
+            std::fs::copy(&s, &d)?;
+        }
+    }
+    Ok(())
+}
+
+/// Standard base64 (RFC 4648, `+/`, `=` padding, no line wrapping) — matches Node
+/// Buffer.toString('base64').
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,5 +1870,16 @@ tools:
             .map(|s| s.to_string())
             .collect();
         assert_eq!(pipeline_bin_arg(&args), vec!["jq", "ripgrep"]);
+    }
+
+    #[test]
+    fn base64_matches_node() {
+        // RFC 4648 vectors == Node Buffer.toString('base64'): padding + no wrapping.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79"); // exercises + and /
     }
 }
