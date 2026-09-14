@@ -8,7 +8,8 @@
 #   2. rust  capsync --render      -> the port under test
 #   3. tests/golden/<case>/*.json  -> committed reference (catches drift in EITHER side)
 #
-# Compared files: authz-antigravity.json, authz-claude-code.json (the spike's scope).
+# Compared files: authz-*.json (Phase 0) + openab-agent-mcp.json / runtime-mcp.json
+# (Phase 1a MCP render axis). More files join as later Phase 1 slices land.
 #
 # Modes:
 #   (default)      build+run rust and node, diff all three. Needs a C linker for cargo.
@@ -24,7 +25,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 SYNC="$REPO/tools/sync.js"
 FIXTURES="$HERE/tests/fixtures"
 GOLDEN="$HERE/tests/golden"
-FILES=(authz-antigravity.json authz-claude-code.json)
+FILES=(authz-antigravity.json authz-claude-code.json openab-agent-mcp.json runtime-mcp.json)
 
 MODE="full"
 case "${1:-}" in
@@ -63,7 +64,8 @@ for capdir in "$FIXTURES"/*/; do
   rustout=""
   if [ "$MODE" = "full" ]; then
     rustout="$tmp/rust/$case"; mkdir -p "$rustout"
-    "$RUST_BIN" --render "$rustout" --capabilities "$cap" >/dev/null
+    # node infers the catalog (REPO) via __dirname; capsync takes it explicitly (ADR 0008).
+    "$RUST_BIN" --render "$rustout" --capabilities "$cap" --catalog "$REPO" >/dev/null
   fi
 
   for f in "${FILES[@]}"; do
