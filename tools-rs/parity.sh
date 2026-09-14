@@ -25,7 +25,7 @@ REPO="$(cd "$HERE/.." && pwd)"
 SYNC="$REPO/tools/sync.js"
 FIXTURES="$HERE/tests/fixtures"
 GOLDEN="$HERE/tests/golden"
-FILES=(authz-antigravity.json authz-claude-code.json openab-agent-mcp.json runtime-mcp.json)
+FILES=(authz-antigravity.json authz-claude-code.json authz-suggest.txt bin-install.tsv openab-agent-mcp.json runtime-mcp.json)
 
 MODE="full"
 case "${1:-}" in

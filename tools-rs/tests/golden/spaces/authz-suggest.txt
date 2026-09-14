@@ -1,0 +1,2 @@
+# authorize_skill_requires: explicit
+# (no enabled skill declares a `requires` command)

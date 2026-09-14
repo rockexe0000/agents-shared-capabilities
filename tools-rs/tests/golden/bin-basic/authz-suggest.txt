@@ -1,0 +1,3 @@
+# authorize_skill_requires: auto
+# commands enabled skills require (paste an allow rule into permissions.md to grant):
+#   demotool  (from demotool)  [granted]
