@@ -1,0 +1,6 @@
+{
+  "allow": [
+    "command(ripgrep)"
+  ],
+  "deny": []
+}

@@ -1,0 +1,34 @@
+name: tooling-rs-parity
+
+# ADR 0008 Phase 0/1 gate: the Rust `capsync` port must stay byte-for-byte identical to
+# `tools/sync.js --render` (authz axis for the spike; more axes as Phase 1 lands). Runs on
+# ubuntu-latest, which ships a C toolchain (the linker the Rust build needs).
+on:
+  push:
+    branches: [main]
+    paths: ['tools-rs/**', 'tools/**']
+  pull_request:
+    paths: ['tools-rs/**', 'tools/**']
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools-rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test
+      - name: Byte-for-byte parity vs node (rust + node vs committed golden)
+        run: ./parity.sh

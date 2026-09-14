@@ -1,0 +1,22 @@
+[package]
+name = "capsync"
+version = "0.0.0"
+edition = "2021"
+description = "ADR 0008 Phase 0 spike: single-file, runtime-portable capability tooling. Currently implements the authz axis of --render at byte-for-byte parity with tools/sync.js."
+publish = false
+
+[[bin]]
+name = "capsync"
+path = "src/main.rs"
+
+# Phase 0 dependency decision: ZERO external crates. The authz artifacts are a
+# fixed-shape object of string arrays; a hand-rolled serializer that mirrors
+# JSON.stringify(x, null, 2) is smaller and safer for byte-for-byte parity than
+# pulling serde_json (whose escaping / key-order guarantees we'd have to re-verify
+# against V8 anyway). Revisit only if a later axis needs real JSON *parsing*.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

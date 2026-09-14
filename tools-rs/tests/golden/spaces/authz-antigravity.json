@@ -1,0 +1,7 @@
+{
+  "allow": [
+    "command(aardvark)",
+    "command(git status)"
+  ],
+  "deny": []
+}
