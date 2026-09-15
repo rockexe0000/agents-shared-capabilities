@@ -39,7 +39,7 @@ The gate renders every fixture under `tests/fixtures/<case>/` three ways — nod
 committed `tests/golden/<case>/` — and fails on any diff, so a regression in **either** side is
 caught. It also exercises the stateful paths in isolated `$HOME`s (live `sync` skills/MCP/hooks,
 `--check`, `--check-tools`, `--with-tools` via a `file://` fake asset) comparing node vs rust.
-CI runs the full gate on `ubuntu-latest` (`.github/workflows/tooling-rs-parity.yml`).
+CI runs the full gate on `ubuntu-latest` (`.github/workflows/tools-rs-parity.yml`).
 
 > A linker-less environment (no `cc`/`gcc`) can still run `cargo check`, `fmt`, `clippy`, and
 > `./parity.sh --node-only`, but not `cargo test`/`build`/full parity (all require linking). The
@@ -51,7 +51,7 @@ CI runs the full gate on `ubuntu-latest` (`.github/workflows/tooling-rs-parity.y
 
 - **Toolchain pinned** to an exact version in `rust-toolchain.toml` (not floating `stable`);
   bumping is a deliberate PR. `Cargo.lock` is committed; release builds use `--locked`.
-- **Release** (`.github/workflows/tooling-rs-release.yml`, on a `tooling-rs-v*` tag):
+- **Release** (`.github/workflows/tools-rs-release.yml`, on a `v*` tag):
   cross-compiles static musl linux (amd64/arm64) + macos (arm64/x86_64), publishes each
   artifact's **sha256** + a **build-provenance attestation** (`actions/attest-build-provenance`).
 - **Consumers** (Phase 2 ephemeral init) fetch a pinned release asset and verify its sha256
