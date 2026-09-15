@@ -19,6 +19,7 @@ Work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooli
 | `--check <dir> …` | re-render + diff committed artifacts; exit 1 on drift |
 | `sync [--with-tools] [--catalog <d>]` | live projection into `$HOME`: skills symlinks, MCP merge into each runtime config (claude-code/codex/antigravity/opencode + oab-facade), hooks (claude/antigravity); `--with-tools` also fetches+verifies the pinned bin CLIs enabled skills `require` |
 | `--check-tools …` | verify installed bin tools vs the registry (drift → exit 1); no network |
+| `lint [--catalog <d>]` | validate the catalog (bin/skills/mcp/hooks registries: naming, uniqueness, secret hygiene, supply-chain pins, `requires` floors); errors → exit 1 |
 
 `--catalog <dir>` points at a local checkout of this catalog repo (`sync.js` infers it from
 `__dirname`; a standalone binary can't, so it's an explicit flag — falls back to an exe-relative

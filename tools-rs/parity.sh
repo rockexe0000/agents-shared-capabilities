@@ -350,6 +350,24 @@ REG
     fi
   fi
   echo "ok: sync --with-tools (install)"
+
+  # ---- lint parity (Phase 1h) ----
+  # valid: the real catalog → both exit 0. broken: a temp catalog copy with a duplicate mcp
+  # server name → both exit 1. (node lint.js infers REPO from __dirname, so we copy tools/ into
+  # the temp catalog and run it from there.) Compare exit codes.
+  n_lint=0; ( cd "$REPO/tools" && node lint.js >/dev/null 2>&1 ) || n_lint=$?
+  [ "$n_lint" -eq 0 ] || { echo "LINT node: real catalog should be valid, got $n_lint"; fail=1; }
+  bc="$tmp/badcatalog"; mkdir -p "$bc/mcp"; cp -r "$REPO/tools" "$bc/tools"
+  printf 'servers:\n  - name: dup\n  - name: dup\n' > "$bc/mcp/registry.yaml"
+  n_bad=0; ( cd "$bc/tools" && node lint.js >/dev/null 2>&1 ) || n_bad=$?
+  [ "$n_bad" -ne 0 ] || { echo "LINT node: broken catalog should fail, got 0"; fail=1; }
+  if [ "$MODE" = "full" ]; then
+    r_lint=0; "$RUST_BIN" lint --catalog "$REPO" >/dev/null 2>&1 || r_lint=$?
+    [ "$r_lint" -eq "$n_lint" ] || { echo "LINT rust valid exit $r_lint != node $n_lint"; fail=1; }
+    r_bad=0; "$RUST_BIN" lint --catalog "$bc" >/dev/null 2>&1 || r_bad=$?
+    [ "$r_bad" -eq "$n_bad" ] || { echo "LINT rust broken exit $r_bad != node $n_bad"; fail=1; }
+  fi
+  echo "ok: lint (valid + broken)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi

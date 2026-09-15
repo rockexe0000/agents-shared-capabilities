@@ -15,9 +15,9 @@
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
 //! plus `sync` live projection — SKILLS symlink (1e-1), MCP facade + direct for all four
 //! runtimes incl. codex TOML with the secret resolver (1e-2), and hooks (1e-3): full parity
-//! with sync.js's live path. `--check-tools` (bin drift check) and `sync --with-tools` (bin
-//! install: curl fetch + sha256 verify + extract + lockfile + GC) are ported (1f). Remaining:
-//! cross-compile/pin/attest (1g), lint (1h).
+//! with sync.js's live path. `--check-tools` + `sync --with-tools` (bin drift/install) are
+//! ported (1f), and `lint` (catalog validation, folded into this binary) ports tools/lint.js
+//! (1h). This completes the ADR 0008 Phase 1 port of the node/sh tooling surface.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -78,8 +78,23 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().map(|a| a == "lint").unwrap_or(false) {
+        return match lint(&args) {
+            Ok(errored) => {
+                if errored {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     eprintln!(
-        "usage: capsync sync | --render <outdir> | --check <dir> | --check-tools  [--capabilities <file>] [--catalog <dir>]"
+        "usage: capsync sync | lint | --render <outdir> | --check <dir> | --check-tools  [--capabilities <file>] [--catalog <dir>]"
     );
     ExitCode::FAILURE
 }
@@ -803,6 +818,9 @@ struct HookDef {
     event: Option<String>,
     matcher: Option<String>,
     command: Option<String>,
+    source: Option<String>,     // lint only
+    pinned_ref: Option<String>, // lint only
+    checksum: Option<String>,   // lint only
 }
 
 fn parse_hook_registry(text: &str) -> Vec<HookDef> {
@@ -847,6 +865,9 @@ fn parse_hook_registry(text: &str) -> Vec<HookDef> {
             "event" => cur.event = Some(strip(&val)),
             "matcher" => cur.matcher = Some(strip(&val)),
             "command" => cur.command = Some(strip(&val)),
+            "source" => cur.source = Some(strip(&val)),
+            "pinned-ref" => cur.pinned_ref = Some(strip(&val)),
+            "checksum" => cur.checksum = Some(strip(&val)),
             _ => {}
         }
     }
@@ -2213,6 +2234,8 @@ struct BinTool {
     archive: Option<String>,
     url: Option<String>,
     pinned_version: Option<String>,
+    source: Option<String>,             // lint only
+    provenance: Option<String>,         // lint only
     platforms: Vec<(String, Platform)>, // insertion order; TSV re-sorts keys
 }
 
@@ -2279,7 +2302,9 @@ fn parse_bin_registry(text: &str) -> Vec<BinTool> {
                     "archive" => cur.archive = Some(strip(&val)),
                     "url" => cur.url = Some(strip(&val)),
                     "pinned-version" => cur.pinned_version = Some(strip(&val)),
-                    _ => {} // name (dupe), source, provenance, … don't affect the TSV
+                    "source" => cur.source = Some(strip(&val)),
+                    "provenance" => cur.provenance = Some(strip(&val)),
+                    _ => {}
                 }
             }
         }
@@ -2321,29 +2346,39 @@ fn frontmatter_block(text: &str) -> String {
     String::new()
 }
 
-/// Port of parse.js parseRequires, names only (min is unused by render). Block form
-/// (`requires:` then `- name:` items) or inline (`requires: [ {name: x}, … ]`).
-fn parse_requires_names(fm: &str) -> Vec<String> {
+struct Require {
+    name: String,
+    min: Option<String>, // block form only; inline `min:` not parsed (unused by the catalog)
+}
+
+/// Port of parse.js parseRequires. Block form (`requires:` then `- name:`/`min:` items) or
+/// inline (`requires: [ {name: x}, … ]`).
+fn parse_requires(fm: &str) -> Vec<Require> {
     let lines: Vec<&str> = fm.split('\n').collect();
-    let idx = lines.iter().position(|l| is_requires_line(l));
-    match idx {
+    match lines.iter().position(|l| is_requires_line(l)) {
         None => {
             for l in &lines {
                 if let Some(inner) = match_inline_requires(l) {
-                    return extract_inline_names(&inner);
+                    return extract_inline_names(&inner)
+                        .into_iter()
+                        .map(|name| Require { name, min: None })
+                        .collect();
                 }
             }
             Vec::new()
         }
         Some(i) => {
-            let mut out = Vec::new();
+            let mut out: Vec<Require> = Vec::new();
             for l in &lines[i + 1..] {
                 if let Some(name) = match_block_require_name(l) {
-                    out.push(name);
+                    out.push(Require { name, min: None });
                     continue;
                 }
-                if l.trim_start().starts_with("min:") {
-                    continue; // min line — indented, ignored for names
+                if let Some(min) = match_min_line(l) {
+                    if let Some(last) = out.last_mut() {
+                        last.min = Some(min);
+                    }
+                    continue;
                 }
                 if l.chars().next().is_some_and(|c| !c.is_whitespace()) {
                     break; // dedent to the next top-level key
@@ -2352,6 +2387,31 @@ fn parse_requires_names(fm: &str) -> Vec<String> {
             out
         }
     }
+}
+
+fn parse_requires_names(fm: &str) -> Vec<String> {
+    parse_requires(fm).into_iter().map(|r| r.name).collect()
+}
+
+/// JS: /^\s*min:\s*["']?([0-9][\w.+-]*)["']?/ group 1.
+fn match_min_line(l: &str) -> Option<String> {
+    let r = l.trim_start().strip_prefix("min:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix(['"', '\'']).unwrap_or(r);
+    let mut chars = r.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let mut v = String::from(first);
+    for c in chars {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '+' || c == '-' {
+            v.push(c);
+        } else {
+            break;
+        }
+    }
+    Some(v)
 }
 
 /// JS: /^requires:\s*(#.*)?$/ — a bare `requires:` line (optional trailing comment).
@@ -3207,6 +3267,357 @@ fn gc_tools(keep: &[String], home: &Path) -> Vec<String> {
     removed
 }
 
+// ============================================================================
+// catalog lint (ADR 0008 Phase 1h) — port of tools/lint.js, folded into the one binary as
+// `capsync lint`. Validates bin/skills/mcp/hooks registries; prints errors + exit 1 on any.
+// ============================================================================
+
+const CANONICAL_HOOK_EVENTS: [&str; 5] = [
+    "pre-tool",
+    "post-tool",
+    "session-start",
+    "stop",
+    "user-prompt-submit",
+];
+
+fn is_kebab_64(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// JS scalar(fm, key): /^key:\s*(.+)$/m → trimmed, one leading/trailing quote stripped.
+fn fm_scalar(fm: &str, key: &str) -> Option<String> {
+    for line in fm.split('\n') {
+        if let Some(rest) = line.strip_prefix(key).and_then(|r| r.strip_prefix(':')) {
+            let v = rest.trim();
+            if v.is_empty() {
+                continue;
+            }
+            let b = v.as_bytes();
+            let start = usize::from(b[0] == b'"' || b[0] == b'\'');
+            let end = v.len()
+                - usize::from(
+                    v.len() > start && (b[v.len() - 1] == b'"' || b[v.len() - 1] == b'\''),
+                );
+            return Some(v[start..end].to_string());
+        }
+    }
+    None
+}
+
+/// JS cmpVer: strip one leading v/=, split on [.+-], compare parseInt-of-leading-digits per
+/// field (missing/non-numeric → 0). a<b:-1, a==b:0, a>b:1.
+fn cmp_ver(a: &str, b: &str) -> i32 {
+    fn field(f: &str) -> i64 {
+        f.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    }
+    fn norm(v: &str) -> Vec<i64> {
+        let v = v
+            .strip_prefix('v')
+            .or_else(|| v.strip_prefix('='))
+            .unwrap_or(v);
+        v.split(['.', '+', '-']).map(field).collect()
+    }
+    let (x, y) = (norm(a), norm(b));
+    for i in 0..x.len().max(y.len()) {
+        let (xi, yi) = (*x.get(i).unwrap_or(&0), *y.get(i).unwrap_or(&0));
+        if xi != yi {
+            return if xi < yi { -1 } else { 1 };
+        }
+    }
+    0
+}
+
+/// JS: /^\s*-\s*name:\s*(.+)$/ group 1 (trimmed, no quote strip) — mcp registry dup-name scan.
+fn match_line_name(ln: &str) -> Option<String> {
+    let r = ln
+        .trim_start()
+        .strip_prefix('-')?
+        .trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix("name:")?.trim();
+    if r.is_empty() {
+        None
+    } else {
+        Some(r.to_string())
+    }
+}
+
+/// JS: /^\s{6,}[A-Za-z0-9_-]+:\s*["']?([^"'#]+)/ group 1 (trimmed) — an indented env/header value.
+fn match_indented_value(ln: &str) -> Option<String> {
+    if ln.len() - ln.trim_start().len() < 6 {
+        return None;
+    }
+    let t = ln.trim_start();
+    let key: String = t
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if key.is_empty() {
+        return None;
+    }
+    let rest = t[key.len()..]
+        .strip_prefix(':')?
+        .trim_start_matches([' ', '\t']);
+    let rest = rest.strip_prefix(['"', '\'']).unwrap_or(rest);
+    let cap: String = rest
+        .chars()
+        .take_while(|c| *c != '"' && *c != '\'' && *c != '#')
+        .collect();
+    let cap = cap.trim();
+    if cap.is_empty() {
+        None
+    } else {
+        Some(cap.to_string())
+    }
+}
+
+fn line_has_secret_word(ln: &str) -> bool {
+    let l = ln.to_lowercase();
+    ["token", "secret", "key", "password", "authorization"]
+        .iter()
+        .any(|w| l.contains(w))
+}
+
+/// `capsync lint`: validate the catalog. Returns Ok(true) if there were errors (→ exit 1).
+/// Port of tools/lint.js.
+fn lint(args: &[String]) -> Result<bool, String> {
+    let catalog = resolve_catalog(args).ok_or("cannot resolve catalog (pass --catalog <dir>)")?;
+    let mut errors: Vec<String> = Vec::new();
+    let mut bin_tools: HashMap<String, BinTool> = HashMap::new();
+
+    // ---- bin registry ----
+    if let Ok(text) = std::fs::read_to_string(catalog.join("bin").join("registry.yaml")) {
+        let mut names = HashSet::new();
+        for t in parse_bin_registry(&text) {
+            let at = format!(
+                "bin/registry.yaml '{}'",
+                if t.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &t.name
+                }
+            );
+            if t.name.is_empty() {
+                errors.push(format!("{at}: missing name"));
+                continue;
+            }
+            if !is_kebab_64(&t.name) {
+                errors.push(format!("{at}: name must be kebab-case, ≤64"));
+            }
+            if !names.insert(t.name.clone()) {
+                errors.push(format!("{at}: duplicate tool name"));
+            }
+            if t.source.is_none() {
+                errors.push(format!("{at}: missing source"));
+            }
+            if let Some(p) = &t.provenance {
+                if !["none", "attestation", "cosign"].contains(&p.as_str()) {
+                    errors.push(format!("{at}: provenance must be none|attestation|cosign"));
+                }
+            }
+            let external = t
+                .source
+                .as_deref()
+                .is_some_and(|s| s.to_lowercase().starts_with("external:"));
+            if external {
+                if t.pinned_version
+                    .as_deref()
+                    .is_none_or(|v| v.eq_ignore_ascii_case("n/a"))
+                {
+                    errors.push(format!("{at}: external tool needs a real pinned-version"));
+                }
+                if t.platforms.is_empty() {
+                    errors.push(format!("{at}: external tool needs at least one platform"));
+                }
+            }
+            for (p, spec) in &t.platforms {
+                if spec.asset.is_none() {
+                    errors.push(format!("{at}: platform '{p}' missing asset"));
+                }
+                if (external || spec.sha256.is_some())
+                    && !spec.sha256.as_deref().is_some_and(is_hex64)
+                {
+                    errors.push(format!("{at}: platform '{p}' sha256 must be 64 hex"));
+                }
+            }
+            bin_tools.insert(t.name.clone(), t);
+        }
+    }
+
+    // ---- skills ----
+    let skills_dir = catalog.join("skills");
+    if skills_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&skills_dir)
+            .map(|r| r.flatten().collect())
+            .unwrap_or_default();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let sk = dir.join("SKILL.md");
+            if !sk.exists() {
+                errors.push(format!("skills/{name}: missing SKILL.md"));
+                continue;
+            }
+            let fm = frontmatter_block(&std::fs::read_to_string(&sk).unwrap_or_default());
+            if fm.is_empty() {
+                errors.push(format!("skills/{name}/SKILL.md: missing frontmatter block"));
+                continue;
+            }
+            match fm_scalar(&fm, "name") {
+                None => errors.push(format!(
+                    "skills/{name}/SKILL.md: frontmatter 'name' missing"
+                )),
+                Some(n) => {
+                    if n != name {
+                        errors.push(format!(
+                            "skills/{name}/SKILL.md: name '{n}' != folder '{name}'"
+                        ));
+                    }
+                    if !is_kebab_64(&n) {
+                        errors.push(format!("skills/{name}: name must be kebab-case, ≤64"));
+                    }
+                    let nl = n.to_lowercase();
+                    if nl.contains("claude") || nl.contains("anthropic") {
+                        errors.push(format!(
+                            "skills/{name}: name must not contain claude/anthropic"
+                        ));
+                    }
+                }
+            }
+            if fm_scalar(&fm, "description").is_none() {
+                errors.push(format!(
+                    "skills/{name}/SKILL.md: frontmatter 'description' missing/empty"
+                ));
+            }
+            for r in parse_requires(&fm) {
+                match bin_tools.get(&r.name) {
+                    None => errors.push(format!(
+                        "skills/{name}: requires '{}' has no bin/registry.yaml entry",
+                        r.name
+                    )),
+                    Some(tool) => {
+                        if let (Some(min), Some(pinned)) = (&r.min, &tool.pinned_version) {
+                            if !pinned.eq_ignore_ascii_case("n/a") && cmp_ver(pinned, min) < 0 {
+                                errors.push(format!(
+                                    "skills/{name}: requires {} ≥ {min} but bin registry pins {pinned}",
+                                    r.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- mcp registry (line-based dup-name + secret hygiene) ----
+    if let Ok(text) = std::fs::read_to_string(catalog.join("mcp").join("registry.yaml")) {
+        let mut names = HashSet::new();
+        for (i, ln) in text.split('\n').enumerate() {
+            if let Some(v) = match_line_name(ln) {
+                if !names.insert(v.clone()) {
+                    errors.push(format!(
+                        "mcp/registry.yaml:{}: duplicate server name '{v}'",
+                        i + 1
+                    ));
+                }
+            }
+            if let Some(val) = match_indented_value(ln) {
+                let is_ref = ["env:", "op://", "vault:", "${"]
+                    .iter()
+                    .any(|p| val.starts_with(p));
+                if !is_ref && line_has_secret_word(ln) {
+                    errors.push(format!(
+                        "mcp/registry.yaml:{}: value looks like a raw secret; use a reference (env:/op://vault:)",
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    // ---- hooks registry ----
+    if let Ok(text) = std::fs::read_to_string(catalog.join("hooks").join("registry.yaml")) {
+        let mut names = HashSet::new();
+        for h in parse_hook_registry(&text) {
+            let at = format!(
+                "hooks/registry.yaml '{}'",
+                if h.name.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &h.name
+                }
+            );
+            if h.name.is_empty() {
+                errors.push(format!("{at}: missing name"));
+                continue;
+            }
+            if !is_kebab_64(&h.name) {
+                errors.push(format!("{at}: name must be kebab-case, ≤64"));
+            }
+            if !names.insert(h.name.clone()) {
+                errors.push(format!("{at}: duplicate hook name"));
+            }
+            match &h.event {
+                None => errors.push(format!("{at}: missing event")),
+                Some(ev) => {
+                    if !CANONICAL_HOOK_EVENTS.contains(&ev.as_str()) {
+                        errors.push(format!(
+                            "{at}: event '{ev}' not canonical ({})",
+                            CANONICAL_HOOK_EVENTS.join(" | ")
+                        ));
+                    }
+                }
+            }
+            if h.command.is_none() {
+                errors.push(format!("{at}: missing command"));
+            }
+            if h.source
+                .as_deref()
+                .is_some_and(|s| s.to_lowercase().starts_with("external:"))
+            {
+                if h.pinned_ref
+                    .as_deref()
+                    .is_none_or(|r| r.eq_ignore_ascii_case("n/a"))
+                {
+                    errors.push(format!("{at}: external hook needs a real pinned-ref"));
+                }
+                if h.checksum
+                    .as_deref()
+                    .is_none_or(|c| c.eq_ignore_ascii_case("n/a"))
+                {
+                    errors.push(format!("{at}: external hook needs a checksum"));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!("lint OK — capability catalog valid");
+        Ok(false)
+    } else {
+        eprintln!("lint FAIL:");
+        for e in &errors {
+            eprintln!("  ERROR {e}");
+        }
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3481,6 +3892,32 @@ tools:
             .map(|s| s.to_string())
             .collect();
         assert_eq!(pipeline_bin_arg(&args), vec!["jq", "ripgrep"]);
+    }
+
+    #[test]
+    fn lint_helpers() {
+        assert_eq!(cmp_ver("0.6.1", "0.4.0"), 1); // pinned >= floor
+        assert_eq!(cmp_ver("0.6.1", "0.6.1"), 0);
+        assert_eq!(cmp_ver("v1.2", "1.2.0"), 0); // leading v stripped; missing field = 0
+        assert_eq!(cmp_ver("1.2.0", "1.10.0"), -1); // numeric, not lexical
+        assert!(is_kebab_64("cfdrop-relay") && is_kebab_64("jq"));
+        assert!(!is_kebab_64("Cfdrop") && !is_kebab_64("has_underscore") && !is_kebab_64(""));
+        assert!(is_hex64(&"a".repeat(64)) && !is_hex64(&"a".repeat(63)) && !is_hex64("n/a"));
+        assert_eq!(
+            fm_scalar("name: cfdrop\ndescription: x", "name").as_deref(),
+            Some("cfdrop")
+        );
+        assert_eq!(fm_scalar("name: \"q\"", "name").as_deref(), Some("q")); // quote stripped
+        assert_eq!(fm_scalar("other: y", "name"), None);
+        assert_eq!(
+            match_line_name("  - name: octobroker").as_deref(),
+            Some("octobroker")
+        );
+        // indented secret value that is a ref → not flagged; raw → flagged by caller
+        assert_eq!(
+            match_indented_value("      X-Key: \"env:TOK\"").as_deref(),
+            Some("env:TOK")
+        );
     }
 
     #[test]
