@@ -15,7 +15,8 @@
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
 //! plus `sync` live projection — SKILLS symlink (1e-1), MCP facade + direct for all four
 //! runtimes incl. codex TOML with the secret resolver (1e-2), and hooks (1e-3): full parity
-//! with sync.js's live path. Not yet ported: `--with-tools` / `--check-tools`.
+//! with sync.js's live path. `--check-tools` (bin drift check, no network) is ported (1f-1);
+//! `--with-tools` (install: fetch + verify + extract) lands in 1f-2.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -52,6 +53,21 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.iter().any(|a| a == "--check-tools") {
+        return match check_tools(&args) {
+            Ok(drift) => {
+                if drift {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().map(|a| a == "sync").unwrap_or(false) {
         return match sync_cmd(&args) {
             Ok(()) => ExitCode::SUCCESS,
@@ -62,7 +78,7 @@ fn main() -> ExitCode {
         };
     }
     eprintln!(
-        "usage: capsync sync [--catalog <dir>] | --render <outdir> | --check <dir>  [--capabilities <file>]"
+        "usage: capsync sync | --render <outdir> | --check <dir> | --check-tools  [--capabilities <file>] [--catalog <dir>]"
     );
     ExitCode::FAILURE
 }
@@ -2662,6 +2678,225 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+// ============================================================================
+// bin drift check (ADR 0008 Phase 1f-1) — port of install-bin.js platformKey / readLock /
+// checkTool + sync.js checkTools. No network, no HOME writes; exit 1 on drift. --with-tools
+// (install: fetch + verify + extract) lands in 1f-2.
+// ============================================================================
+
+/// JS platformKey(): `<os>-<arch>` with node's darwin→macos, x64→amd64, arm64 pass-through.
+fn platform_key() -> String {
+    let os = std::env::consts::OS; // "linux" / "macos" — matches node's platform spelling
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    format!("{os}-{arch}")
+}
+
+struct BinLock {
+    target: Option<String>,
+    pinned_version: Option<String>,
+    asset_sha256: Option<String>,
+    bin_sha256: Option<String>,
+}
+
+fn json_get_str(j: &Json, key: &str) -> Option<String> {
+    match json_get(j, key) {
+        Some(Json::Str(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// JS readLock: parse ~/.agents-shared-capabilities/state/bin-lock/<name>.json (or None).
+fn read_lock(home: &Path, name: &str) -> Option<BinLock> {
+    let f = home
+        .join(".agents-shared-capabilities")
+        .join("state")
+        .join("bin-lock")
+        .join(format!("{name}.json"));
+    let text = std::fs::read_to_string(&f).ok()?;
+    let j = parse_json(&text).ok()?;
+    Some(BinLock {
+        target: json_get_str(&j, "target"),
+        pinned_version: json_get_str(&j, "pinned-version"),
+        asset_sha256: json_get_str(&j, "asset-sha256"),
+        bin_sha256: json_get_str(&j, "bin-sha256"),
+    })
+}
+
+/// Port of checkTool: verify installed state vs the registry. Returns (clean, STATUS, detail);
+/// clean == ok|unsupported (no drift). Mirrors install-bin.js status words.
+fn check_tool(tool: &BinTool, home: &Path) -> (bool, &'static str, String) {
+    let pk = platform_key();
+    let spec = tool
+        .platforms
+        .iter()
+        .find(|(k, _)| *k == pk)
+        .map(|(_, s)| s);
+    let lock = read_lock(home, &tool.name);
+    let Some(spec) = spec else {
+        return (true, "UNSUPPORTED", format!("no asset for platform {pk}"));
+    };
+    let Some(lock) = lock else {
+        return (false, "MISSING", "not installed (no lockfile)".to_string());
+    };
+    let Some(target) = lock.target.clone().filter(|t| !t.is_empty()) else {
+        return (false, "MISSING", "not installed (no lockfile)".to_string());
+    };
+    if !Path::new(&target).exists() {
+        return (false, "MISSING", format!("binary gone: {target}"));
+    }
+    if lock.pinned_version.as_deref() != tool.pinned_version.as_deref()
+        || lock.asset_sha256.as_deref() != spec.sha256.as_deref()
+    {
+        return (
+            false,
+            "STALE",
+            format!(
+                "installed {} but registry pins {}",
+                lock.pinned_version.clone().unwrap_or_default(),
+                tool.pinned_version.clone().unwrap_or_default()
+            ),
+        );
+    }
+    match sha256_file(Path::new(&target)) {
+        Some(h) if Some(h.as_str()) == lock.bin_sha256.as_deref() => (
+            true,
+            "OK",
+            format!(
+                "{} @ {target}",
+                tool.pinned_version.clone().unwrap_or_default()
+            ),
+        ),
+        _ => (
+            false,
+            "TAMPERED",
+            format!("on-disk sha256 != lock ({target})"),
+        ),
+    }
+}
+
+/// `--check-tools`: verify each required tool's installed state for drift (exit 1). No network,
+/// no HOME writes. Honors --capabilities (like --check). Port of sync.js checkTools().
+fn check_tools(args: &[String]) -> Result<bool, String> {
+    let cap_file = cap_file_from(args)?;
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
+    let catalog = resolve_catalog(args);
+    let base = personal_base(&cap_file);
+    let enable = parse_enable(&cap_file);
+    let tools = load_bin_tools(catalog.as_deref(), base.as_deref());
+    let names = required_tool_names(&enable, catalog.as_deref(), base.as_deref());
+    let pk = platform_key();
+    println!(
+        "bin drift check (platform {pk}) — required: {}",
+        if names.is_empty() {
+            "(none)".to_string()
+        } else {
+            names.join(", ")
+        }
+    );
+    let mut drift = false;
+    for nm in &names {
+        match tools.get(nm) {
+            None => {
+                drift = true;
+                eprintln!("  {nm}: DRIFT — not in bin/registry.yaml");
+            }
+            Some(t) => {
+                let (clean, status, detail) = check_tool(t, &home);
+                if !clean {
+                    drift = true;
+                }
+                println!("  {nm}: {status} — {detail}");
+            }
+        }
+    }
+    println!(
+        "{}",
+        if drift {
+            "\nbin drift detected — run `capsync sync --with-tools`"
+        } else {
+            "\nno bin drift — installed tools current"
+        }
+    );
+    Ok(drift)
+}
+
+// ---- SHA-256 (RFC 6234), zero-crate — matches Node crypto sha256 hex digest. ----
+#[rustfmt::skip]
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64).wrapping_mul(8);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            let b = i * 4;
+            *wi = u32::from_be_bytes([chunk[b], chunk[b + 1], chunk[b + 2], chunk[b + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v = [
+                t1.wrapping_add(t2),
+                v[0],
+                v[1],
+                v[2],
+                v[3].wrapping_add(t1),
+                v[4],
+                v[5],
+                v[6],
+            ];
+        }
+        for (hi, vi) in h.iter_mut().zip(v.iter()) {
+            *hi = hi.wrapping_add(*vi);
+        }
+    }
+    h.iter().map(|x| format!("{x:08x}")).collect()
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    std::fs::read(path).ok().map(|d| sha256_hex(&d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2936,6 +3171,30 @@ tools:
             .map(|s| s.to_string())
             .collect();
         assert_eq!(pipeline_bin_arg(&args), vec!["jq", "ripgrep"]);
+    }
+
+    #[test]
+    fn sha256_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"The quick brown fox jumps over the lazy dog"),
+            "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
+        );
+    }
+
+    #[test]
+    fn platform_key_maps() {
+        // whatever host we're on, the key is <os>-<arch> with node's arch spelling.
+        let pk = platform_key();
+        assert!(pk.contains('-'));
+        assert!(!pk.contains("x86_64") && !pk.contains("aarch64"));
     }
 
     #[test]
