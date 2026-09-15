@@ -12,9 +12,9 @@
 //!   - bin (Phase 1b): bin-install.tsv from enabled skills' `requires` (∪ --pipeline-bin).
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
-//! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are both
-//! ported. Not yet ported (later Phase 1 slices): live `sync` projection (skills symlink /
-//! MCP merge / hooks), `--with-tools` / `--check-tools`.
+//! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
+//! plus `sync` live projection — SKILLS symlink axis (Phase 1e-1). Not yet ported: live MCP
+//! merge + hooks projection (1e-2/3), `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -51,8 +51,17 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().map(|a| a == "sync").unwrap_or(false) {
+        return match sync_cmd(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     eprintln!(
-        "usage: capsync --render <outdir> | --check <dir>  [--capabilities <file>] [--catalog <dir>]"
+        "usage: capsync sync [--catalog <dir>] | --render <outdir> | --check <dir>  [--capabilities <file>]"
     );
     ExitCode::FAILURE
 }
@@ -184,6 +193,128 @@ fn check(args: &[String]) -> Result<bool, String> {
         }
     );
     Ok(drift)
+}
+
+// ----------------------------------------------------------------------------
+// live `sync` projection (ADR 0008 Phase 1e) — mutates $HOME to project the enabled subset
+// into installed runtimes. Phase 1e-1 covers the SKILLS axis only (symlink each enabled skill
+// into each runtime's skills dir); MCP merge + hooks land in later 1e sub-slices, so this is
+// a PARTIAL sync that runs parallel to node's sync.js (never the sole projector yet).
+// ----------------------------------------------------------------------------
+
+// (id, runtime base dir, skills dir) relative to $HOME. base must exist for the runtime to be
+// considered installed; skills go under skillsDir. Mirrors sync.js SKILL_RUNTIMES.
+const SKILL_RUNTIMES: &[(&str, &[&str], &[&str])] = &[
+    ("claude-code", &[".claude"], &[".claude", "skills"]),
+    ("codex", &[".codex"], &[".codex", "skills"]),
+    (
+        "antigravity",
+        &[".gemini"],
+        &[".gemini", "antigravity-cli", "skills"],
+    ),
+    (
+        "opencode",
+        &[".config", "opencode"],
+        &[".config", "opencode", "skills"],
+    ),
+];
+
+fn join_all(base: &Path, parts: &[&str]) -> PathBuf {
+    let mut p = base.to_path_buf();
+    for c in parts {
+        p.push(c);
+    }
+    p
+}
+
+/// JS skillSource: catalog → <catalog>/skills/<name>; personal → <base>/skills/<name>.
+fn skill_source(s: &EnableSkill, catalog: Option<&Path>, base: Option<&Path>) -> Option<PathBuf> {
+    match s.source.as_str() {
+        "catalog" => catalog.map(|c| c.join("skills").join(&s.name)),
+        "personal" => base.map(|b| b.join("skills").join(&s.name)),
+        _ => None,
+    }
+}
+
+/// JS linkSkill: symlink <skills_dir>/<name> → src. up-to-date if it already points there;
+/// CONFLICT (skip) if a non-symlink is in the way; otherwise (re)create the symlink.
+fn link_skill(rt_base: &Path, skills_dir: &Path, name: &str, src: &Path) -> String {
+    if !rt_base.exists() {
+        return "skip (runtime not installed)".to_string();
+    }
+    let _ = std::fs::create_dir_all(skills_dir);
+    let dest = skills_dir.join(name);
+    if let Ok(md) = std::fs::symlink_metadata(&dest) {
+        if md.file_type().is_symlink() {
+            if std::fs::read_link(&dest).ok().as_deref() == Some(src) {
+                return "up-to-date".to_string();
+            }
+            // symlink to a different target → fall through and relink
+        } else {
+            return format!(
+                "CONFLICT: {} exists and is not our symlink — skipped",
+                dest.display()
+            );
+        }
+    }
+    let _ = std::fs::remove_file(&dest); // force-remove a stale symlink/file
+    match std::os::unix::fs::symlink(src, &dest) {
+        Ok(()) => format!("linked → {}", src.display()),
+        Err(e) => format!("ERROR symlink failed: {e}"),
+    }
+}
+
+/// `capsync sync`: live projection into $HOME. Phase 1e-1 = skills symlink axis only.
+/// Reads $HOME/personal/capabilities.md (like sync.js's live path, NOT --capabilities).
+fn sync_cmd(args: &[String]) -> Result<(), String> {
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
+    let catalog = resolve_catalog(args);
+    let cap_file = home.join("personal").join("capabilities.md");
+    let enable = parse_enable(&cap_file);
+    // JS personalBase(): dirname(realpath($HOME/personal)) == personal_base of its capabilities.md.
+    let base = personal_base(&cap_file);
+
+    let listed = if enable.skills.is_empty() {
+        "(none)".to_string()
+    } else {
+        enable
+            .skills
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("enabled skills: {listed}");
+    for (id, base_c, skills_c) in SKILL_RUNTIMES {
+        let rt_base = join_all(&home, base_c);
+        let skills_dir = join_all(&home, skills_c);
+        for s in &enable.skills {
+            let src = match skill_source(s, catalog.as_deref(), base.as_deref()) {
+                Some(p) => p,
+                None => {
+                    println!(
+                        "  [{id}] {}: ERROR cannot resolve source={}",
+                        s.name, s.source
+                    );
+                    continue;
+                }
+            };
+            if !src.exists() {
+                println!(
+                    "  [{id}] {}: ERROR source missing ({})",
+                    s.name,
+                    src.display()
+                );
+                continue;
+            }
+            println!(
+                "  [{id}] {}: {}",
+                s.name,
+                link_skill(&rt_base, &skills_dir, &s.name, &src)
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `--flag value` lookup mirroring the argv scans in sync.js.
