@@ -12,9 +12,9 @@
 //!   - bin (Phase 1b): bin-install.tsv from enabled skills' `requires` (∪ --pipeline-bin).
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
-//! This completes `--render`'s artifact set. Not yet ported (later Phase 1 slices): live
-//! `sync` projection (skills symlink / MCP merge / hooks), `--check`, `--with-tools` /
-//! `--check-tools`.
+//! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are both
+//! ported. Not yet ported (later Phase 1 slices): live `sync` projection (skills symlink /
+//! MCP merge / hooks), `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -26,103 +26,164 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
-            eprintln!("{msg}");
-            ExitCode::FAILURE
+    // sync.js dispatch: --render takes precedence, then --check. --check exits 1 on drift.
+    if args.iter().any(|a| a == "--render") {
+        return match render(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args.iter().any(|a| a == "--check") {
+        return match check(&args) {
+            Ok(drift) => {
+                if drift {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    eprintln!(
+        "usage: capsync --render <outdir> | --check <dir>  [--capabilities <file>] [--catalog <dir>]"
+    );
+    ExitCode::FAILURE
+}
+
+/// Mirror sync.js capFileArg(): --capabilities <file>, else $HOME/personal/capabilities.md.
+fn cap_file_from(args: &[String]) -> Result<PathBuf, String> {
+    match flag_value(args, "--capabilities") {
+        Some(v) => Ok(PathBuf::from(v)),
+        None => {
+            let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+            Ok(Path::new(&home).join("personal").join("capabilities.md"))
         }
     }
 }
 
-fn run(args: &[String]) -> Result<(), String> {
-    if !args.iter().any(|a| a == "--render") {
-        return Err(
-            "usage: capsync --render <outdir> [--capabilities <file>] [--catalog <dir>]\n\
-                    (emits authz-*.json + openab-agent-mcp.json + runtime-mcp.json)"
-                .into(),
-        );
-    }
-    let out_dir = flag_value(args, "--render")
-        .filter(|v| !v.starts_with("--"))
-        .ok_or("usage: capsync --render <outdir> [--capabilities <capabilities.md>]")?;
-
-    // Mirror sync.js capFileArg(): default $HOME/personal/capabilities.md.
-    let cap_file = match flag_value(args, "--capabilities") {
-        Some(v) => PathBuf::from(v),
-        None => {
-            let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
-            Path::new(&home).join("personal").join("capabilities.md")
-        }
-    };
-
-    // Shared inputs (mirror buildArtifacts): catalog (REPO) root, the agent's personal
-    // namespace base, and the enable-list. permissions.md sits beside capabilities.md.
-    let catalog = resolve_catalog(args);
-    let base = personal_base(&cap_file);
-    let enable = parse_enable(&cap_file);
+/// permissions.md sits beside the capabilities file (same personal namespace).
+fn read_perms_beside(cap_file: &Path) -> String {
     let perms_file = cap_file
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("permissions.md");
-    let perms_text = std::fs::read_to_string(&perms_file).unwrap_or_default();
+    std::fs::read_to_string(&perms_file).unwrap_or_default()
+}
+
+/// Port of sync.js buildArtifacts(): the full ordered set of rendered artifacts as
+/// (filename, content) pairs. Shared by --render (write) and --check (compare) so both see
+/// identical bytes. Order mirrors the JS `files` object.
+fn build_artifacts(
+    args: &[String],
+    cap_file: &Path,
+    catalog: Option<&Path>,
+    base: Option<&Path>,
+) -> Vec<(String, String)> {
+    let enable = parse_enable(cap_file);
+    let perms_text = read_perms_beside(cap_file);
+
+    let registry = build_registry(catalog, base);
+    let (facade, direct) = split_mcp_routes(&enable, &registry);
+
+    let bin_tools = load_bin_tools(catalog, base);
+    let pipeline = pipeline_bin_arg(args);
+    let bins = bin_list(&enable, &bin_tools, catalog, base, &pipeline);
+
+    let bundle = build_skills_bundle(&enable, catalog, base);
+    let authz = build_authz(&perms_text, &enable, catalog, base);
+
+    let mut out: Vec<(String, String)> = vec![
+        ("openab-agent-mcp.json".to_string(), as_cfg(&facade)),
+        ("runtime-mcp.json".to_string(), as_cfg(&direct)),
+        ("bin-install.tsv".to_string(), bin_install_tsv(&bins)),
+        ("skills.tar.b64".to_string(), bundle.tar_b64),
+        ("skills.list".to_string(), bundle.list),
+    ];
+    for rt in AUTHZ_RUNTIMES {
+        out.push((
+            format!("authz-{}.json", rt.id),
+            stringify_authz(&map_authz(rt, &authz)),
+        ));
+    }
+    out.push(("authz-suggest.txt".to_string(), suggest_text(&authz)));
+    out
+}
+
+/// --render <outdir>: write every artifact off-pod (for infra to bake as a configMap).
+fn render(args: &[String]) -> Result<(), String> {
+    let out_dir = flag_value(args, "--render")
+        .filter(|v| !v.starts_with("--"))
+        .ok_or("usage: capsync --render <outdir> [--capabilities <file>] [--catalog <dir>]")?;
+    let cap_file = cap_file_from(args)?;
+    let catalog = resolve_catalog(args);
+    let base = personal_base(&cap_file);
+    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref());
 
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {out_dir}: {e}"))?;
     let out = Path::new(&out_dir);
-
-    // ---- authz axis (ADR 0007; auto mode + authz-suggest.txt completed in Phase 1b) ----
-    let authz = build_authz(&perms_text, &enable, catalog.as_deref(), base.as_deref());
-    for rt in AUTHZ_RUNTIMES {
-        let mapped = map_authz(rt, &authz);
-        let path = out.join(format!("authz-{}.json", rt.id));
-        std::fs::write(&path, stringify_authz(&mapped))
-            .map_err(|e| format!("write {}: {e}", path.display()))?;
+    for (name, content) in &artifacts {
+        std::fs::write(out.join(name), content).map_err(|e| format!("write {name}: {e}"))?;
     }
-    std::fs::write(out.join("authz-suggest.txt"), suggest_text(&authz))
-        .map_err(|e| format!("write authz-suggest.txt: {e}"))?;
-
-    // ---- bin axis (ADR 0006 Phase D) — bin-install.tsv: one row per (tool, platform) the
-    // enabled skills `require` (∪ --pipeline-bin), for the pod's no-node bin-apply.sh. ----
-    let bin_tools = load_bin_tools(catalog.as_deref(), base.as_deref());
-    let pipeline = pipeline_bin_arg(args);
-    let bin_list = bin_list(
-        &enable,
-        &bin_tools,
-        catalog.as_deref(),
-        base.as_deref(),
-        &pipeline,
-    );
-    std::fs::write(out.join("bin-install.tsv"), bin_install_tsv(&bin_list))
-        .map_err(|e| format!("write bin-install.tsv: {e}"))?;
-
-    // ---- skills axis (ADR 0002 pod-projection) — a deterministic tar of the enabled skills'
-    // dirs (base64'd for the text configMap) + skills.list for GC. Shells to the same `tar` as
-    // sync.js so the bytes match; staging modes mirror node (root 0700, dirs 0755, files kept). ----
-    let bundle = build_skills_bundle(&enable, catalog.as_deref(), base.as_deref());
-    std::fs::write(out.join("skills.tar.b64"), &bundle.tar_b64)
-        .map_err(|e| format!("write skills.tar.b64: {e}"))?;
-    std::fs::write(out.join("skills.list"), &bundle.list)
-        .map_err(|e| format!("write skills.list: {e}"))?;
-
-    // ---- MCP axis (ADR 0008 Phase 1a) — openab-agent-mcp.json (facade) + runtime-mcp.json
-    // (direct). Render does NOT resolve secrets: both routes go through shapeServer, which
-    // rewrites env:VAR -> ${env:VAR}. ----
-    let registry = build_registry(catalog.as_deref(), base.as_deref());
-    let (facade, direct) = split_mcp_routes(&enable, &registry);
-    std::fs::write(out.join("openab-agent-mcp.json"), as_cfg(&facade))
-        .map_err(|e| format!("write openab-agent-mcp.json: {e}"))?;
-    std::fs::write(out.join("runtime-mcp.json"), as_cfg(&direct))
-        .map_err(|e| format!("write runtime-mcp.json: {e}"))?;
-
-    println!(
-        "rendered authz-*.json (mode {}) + bin-install.tsv ({} tool(s)) + mcp (facade: {} / direct: {}) -> {}",
-        authz.flag,
-        bin_list.len(),
-        names(&facade),
-        names(&direct),
-        out_dir,
-    );
+    println!("rendered {} artifact(s) -> {}", artifacts.len(), out_dir);
     Ok(())
+}
+
+/// --check <dir>: re-render and compare against committed artifacts. Deterministic, no HOME
+/// writes. Returns Ok(true) on drift (→ exit 1), Ok(false) if in sync. Port of sync.js check().
+fn check(args: &[String]) -> Result<bool, String> {
+    let dir = flag_value(args, "--check")
+        .filter(|v| !v.starts_with("--"))
+        .ok_or("usage: capsync --check <committed-artifacts-dir> [--capabilities <file>] [--catalog <dir>]")?;
+    let cap_file = cap_file_from(args)?;
+    let catalog = resolve_catalog(args);
+    let base = personal_base(&cap_file);
+    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref());
+
+    let dir = Path::new(&dir);
+    let mut drift = false;
+    for (name, want) in &artifacts {
+        let committed = dir.join(name);
+        match std::fs::read_to_string(&committed) {
+            Ok(ref have) if have == want => println!("  {name}: IN SYNC"),
+            Ok(have) => {
+                drift = true;
+                eprintln!("  {name}: DRIFT — committed differs from freshly rendered");
+                // minimal line-level hint (mirror sync.js)
+                let w: Vec<&str> = want.split('\n').collect();
+                let h: Vec<&str> = have.split('\n').collect();
+                for i in 0..w.len().max(h.len()) {
+                    if w.get(i) != h.get(i) {
+                        if let Some(hl) = h.get(i) {
+                            eprintln!("      - committed: {hl}");
+                        }
+                        if let Some(wl) = w.get(i) {
+                            eprintln!("      + rendered:  {wl}");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                drift = true;
+                eprintln!("  {name}: DRIFT — missing in {}", dir.display());
+            }
+        }
+    }
+    println!(
+        "{}",
+        if drift {
+            "\ndrift detected — re-render and commit the artifacts"
+        } else {
+            "\nno drift — committed artifacts are current"
+        }
+    );
+    Ok(drift)
 }
 
 /// `--flag value` lookup mirroring the argv scans in sync.js.
@@ -883,17 +944,6 @@ fn as_cfg(list: &[Server]) -> String {
     let mut out = stringify(&obj, 0);
     out.push('\n');
     out
-}
-
-fn names(list: &[Server]) -> String {
-    if list.is_empty() {
-        "none".to_string()
-    } else {
-        list.iter()
-            .map(|s| s.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
 }
 
 /// Split the enabled servers into (facade, direct) by route, preserving enable-list order.
