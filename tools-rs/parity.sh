@@ -106,6 +106,40 @@ if [ -f "$negcap" ]; then
   echo "ok: --check drift (negative)"
 fi
 
+# ---- sync (live projection) parity — SKILLS symlink axis (Phase 1e-1) ----
+# Isolated $HOME enabling a catalog skill; node vs rust `sync` must produce identical skill
+# symlinks across the runtime skills dirs. (MCP/hooks projection compared in later 1e slices.)
+if [ "$MODE" != "update-golden" ]; then
+  make_synchome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/.claude" "$h/.codex" "$h/.gemini/antigravity-cli" "$h/.config/opencode"
+    printf 'skills:\n  - name: cfdrop\n    source: catalog\nmcp:\n  servers:\nhooks:\n' \
+      > "$h/personal/capabilities.md"
+  }
+  collect_links() {
+    local h="$1"
+    for d in ".claude/skills" ".codex/skills" ".gemini/antigravity-cli/skills" ".config/opencode/skills"; do
+      [ -d "$h/$d" ] || continue
+      for l in "$h/$d"/*; do [ -L "$l" ] && echo "$d/$(basename "$l") -> $(readlink "$l")"; done
+    done | sort
+  }
+  hn="$tmp/synchome_n"; make_synchome "$hn"
+  ( cd "$REPO/tools" && HOME="$hn" node sync.js >/dev/null 2>&1 )
+  ln_out="$(collect_links "$hn")"
+  if ! printf '%s\n' "$ln_out" | grep -q "\.claude/skills/cfdrop -> $REPO/skills/cfdrop"; then
+    echo "SYNC node: cfdrop not linked as expected:"; printf '%s\n' "$ln_out"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    hr="$tmp/synchome_r"; make_synchome "$hr"
+    HOME="$hr" "$RUST_BIN" sync --catalog "$REPO" >/dev/null 2>&1
+    lr_out="$(collect_links "$hr")"
+    if [ "$ln_out" != "$lr_out" ]; then
+      echo "SYNC rust vs node symlink drift:"; diff <(printf '%s\n' "$ln_out") <(printf '%s\n' "$lr_out"); fail=1
+    fi
+  fi
+  echo "ok: sync (skills symlink)"
+fi
+
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
 if [ "$fail" -ne 0 ]; then echo "PARITY FAILED"; exit 1; fi
 echo "PARITY OK ($MODE)"
