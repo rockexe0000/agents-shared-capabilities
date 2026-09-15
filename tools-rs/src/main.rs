@@ -15,8 +15,9 @@
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
 //! plus `sync` live projection — SKILLS symlink (1e-1), MCP facade + direct for all four
 //! runtimes incl. codex TOML with the secret resolver (1e-2), and hooks (1e-3): full parity
-//! with sync.js's live path. `--check-tools` (bin drift check, no network) is ported (1f-1);
-//! `--with-tools` (install: fetch + verify + extract) lands in 1f-2.
+//! with sync.js's live path. `--check-tools` (bin drift check) and `sync --with-tools` (bin
+//! install: curl fetch + sha256 verify + extract + lockfile + GC) are ported (1f). Remaining:
+//! cross-compile/pin/attest (1g), lint (1h).
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -1145,6 +1146,40 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
         project_antigravity_hooks(&resolved_hooks, &home)?;
     }
     println!("[hooks] projected: {}", resolved_hooks.len());
+
+    // ---- bin tools (ADR 0006 Phase B; opt-in via --with-tools) — fetch+verify the pinned
+    // CLIs enabled skills require into a managed bin dir, then GC no-longer-required ones. ----
+    if args.iter().any(|a| a == "--with-tools") {
+        println!("[bin tools]");
+        let tools = load_bin_tools(catalog.as_deref(), base.as_deref());
+        let names = required_tool_names(&enable, catalog.as_deref(), base.as_deref());
+        let idir = install_dir(&home);
+        println!(
+            "required by enabled skills: {}",
+            if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(", ")
+            }
+        );
+        println!(
+            "install dir: {} (platform {})",
+            idir.display(),
+            platform_key()
+        );
+        for nm in &names {
+            match tools.get(nm) {
+                None => println!("  {nm}: ERROR not in bin/registry.yaml"),
+                Some(t) => match install_tool(t, &home, &idir) {
+                    Ok((status, detail)) => println!("  {nm}: {status} — {detail}"),
+                    Err(e) => println!("  {nm}: ERROR {e}"),
+                },
+            }
+        }
+        for g in gc_tools(&names, &home) {
+            println!("  {g}: removed (no longer required)");
+        }
+    }
     Ok(())
 }
 
@@ -2895,6 +2930,281 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn sha256_file(path: &Path) -> Option<String> {
     std::fs::read(path).ok().map(|d| sha256_hex(&d))
+}
+
+// ============================================================================
+// bin install (ADR 0008 Phase 1f-2) — port of install-bin.js installDir / urlFor /
+// fetchVerified / extractBinary / installTool / gcTools + sync.js --with-tools. Network
+// (curl) + on-disk executables: the real blast radius, so it's off unless --with-tools.
+// ============================================================================
+
+fn dir_writable(d: &Path) -> bool {
+    let probe = d.join(".capsync-write-probe");
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// JS installDir: BIN_INSTALL_DIR, else ~/.local/bin if on PATH, else a writable on-PATH HOME
+/// dir, else ~/.local/bin (with a warning). Side effect: may create ~/.local/bin.
+fn install_dir(home: &Path) -> PathBuf {
+    if let Ok(d) = std::env::var("BIN_INSTALL_DIR") {
+        return PathBuf::from(d);
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    let parts: Vec<&str> = path.split(':').collect();
+    let local = home.join(".local").join("bin");
+    let local_s = local.to_string_lossy().to_string();
+    if parts.contains(&local_s.as_str()) {
+        let _ = std::fs::create_dir_all(&local);
+        if dir_writable(&local) {
+            return local;
+        }
+    }
+    let home_s = home.to_string_lossy().to_string();
+    for d in &parts {
+        if !d.is_empty()
+            && d.starts_with(&home_s)
+            && Path::new(d).exists()
+            && dir_writable(Path::new(d))
+        {
+            return PathBuf::from(d);
+        }
+    }
+    let _ = std::fs::create_dir_all(&local);
+    if !parts.contains(&local_s.as_str()) {
+        eprintln!("bin: WARN {local_s} not on PATH — add it so required CLIs resolve");
+    }
+    local
+}
+
+/// JS urlFor: substitute ${version} / ${asset} in the tool's url template.
+fn url_for(tool: &BinTool, spec: &Platform) -> String {
+    tool.url
+        .clone()
+        .unwrap_or_default()
+        .replace(
+            "${version}",
+            &tool.pinned_version.clone().unwrap_or_default(),
+        )
+        .replace("${asset}", &spec.asset.clone().unwrap_or_default())
+}
+
+/// JS fetchVerified: curl -sSfL --max-time 180 -o dest url, then verify sha256 (abort on mismatch).
+fn fetch_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), String> {
+    let out = Command::new("curl")
+        .args(["-sSfL", "--max-time", "180", "-o"])
+        .arg(dest)
+        .arg(url)
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("curl failed ({})", url));
+    }
+    let got = sha256_file(dest).ok_or_else(|| "fetched file unreadable".to_string())?;
+    if got.to_lowercase() != sha256.to_lowercase() {
+        let _ = std::fs::remove_file(dest);
+        return Err(format!("checksum mismatch: expected {sha256}, got {got}"));
+    }
+    Ok(())
+}
+
+fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(f) = find_file(&p, name) {
+                return Some(f);
+            }
+        } else if entry.file_name() == name {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// JS extractBinary: raw → copy; tar.gz → tar -xzf; zip → unzip -oq. Return the binary's path.
+fn extract_binary(
+    arc: &Path,
+    archive: &str,
+    bin_name: &str,
+    dest_dir: &Path,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
+    match archive {
+        "raw" => {
+            let dst = dest_dir.join(bin_name);
+            std::fs::copy(arc, &dst).map_err(|e| format!("copy raw: {e}"))?;
+            return Ok(dst);
+        }
+        "tar.gz" => {
+            let s = Command::new("tar")
+                .arg("-xzf")
+                .arg(arc)
+                .arg("-C")
+                .arg(dest_dir)
+                .status()
+                .map_err(|e| format!("tar: {e}"))?;
+            if !s.success() {
+                return Err("tar extraction failed".to_string());
+            }
+        }
+        "zip" => {
+            let s = Command::new("unzip")
+                .args(["-oq"])
+                .arg(arc)
+                .arg("-d")
+                .arg(dest_dir)
+                .status()
+                .map_err(|e| format!("unzip: {e}"))?;
+            if !s.success() {
+                return Err("unzip extraction failed".to_string());
+            }
+        }
+        other => return Err(format!("unknown archive type: {other}")),
+    }
+    find_file(dest_dir, bin_name).ok_or_else(|| {
+        format!(
+            "binary '{bin_name}' not found inside {}",
+            arc.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default()
+        )
+    })
+}
+
+/// Port of installTool (non-dry): idempotent fetch+verify+extract+install + lockfile write.
+/// Returns (status, detail). status: unsupported | up-to-date | installed | updated.
+fn install_tool(tool: &BinTool, home: &Path, dest_dir: &Path) -> Result<(String, String), String> {
+    let pk = platform_key();
+    let bin_name = tool.bin.clone().unwrap_or_else(|| tool.name.clone());
+    let Some(spec) = tool
+        .platforms
+        .iter()
+        .find(|(k, _)| *k == pk)
+        .map(|(_, s)| s)
+    else {
+        return Ok((
+            "unsupported".to_string(),
+            format!("no asset for platform {pk}"),
+        ));
+    };
+    let lock = read_lock(home, &tool.name);
+    let satisfied = match &lock {
+        Some(l) => {
+            l.pinned_version.as_deref() == tool.pinned_version.as_deref()
+                && l.asset_sha256.as_deref() == spec.sha256.as_deref()
+                && matches!(&l.target, Some(t) if !t.is_empty() && Path::new(t).exists()
+                    && sha256_file(Path::new(t)).as_deref() == l.bin_sha256.as_deref())
+        }
+        None => false,
+    };
+    if satisfied {
+        let t = lock.and_then(|l| l.target).unwrap_or_default();
+        return Ok((
+            "up-to-date".to_string(),
+            format!("{} @ {t}", tool.pinned_version.clone().unwrap_or_default()),
+        ));
+    }
+    let target = dest_dir.join(&bin_name);
+    let tmp = make_stage_dir().ok_or_else(|| "mktemp failed".to_string())?;
+    let result = (|| -> Result<(String, String), String> {
+        let asset = spec.asset.clone().unwrap_or_default();
+        let arc = tmp.join(&asset);
+        fetch_verified(
+            &url_for(tool, spec),
+            spec.sha256.as_deref().unwrap_or(""),
+            &arc,
+        )?;
+        let extracted = extract_binary(
+            &arc,
+            tool.archive.as_deref().unwrap_or("tar.gz"),
+            &bin_name,
+            &tmp.join("x"),
+        )?;
+        std::fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
+        std::fs::copy(&extracted, &target).map_err(|e| format!("install copy: {e}"))?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod: {e}"))?;
+        let lock_dir = home
+            .join(".agents-shared-capabilities")
+            .join("state")
+            .join("bin-lock");
+        std::fs::create_dir_all(&lock_dir).map_err(|e| format!("mkdir lockdir: {e}"))?;
+        let bin_sha = sha256_file(&target).unwrap_or_default();
+        let lock_json = Json::Obj(vec![
+            ("name".to_string(), Json::Str(tool.name.clone())),
+            (
+                "pinned-version".to_string(),
+                Json::Str(tool.pinned_version.clone().unwrap_or_default()),
+            ),
+            ("platform".to_string(), Json::Str(pk.clone())),
+            ("asset".to_string(), Json::Str(asset)),
+            (
+                "asset-sha256".to_string(),
+                Json::Str(spec.sha256.clone().unwrap_or_default()),
+            ),
+            ("bin-sha256".to_string(), Json::Str(bin_sha)),
+            (
+                "target".to_string(),
+                Json::Str(target.to_string_lossy().to_string()),
+            ),
+            ("bin".to_string(), Json::Str(bin_name.clone())),
+        ]);
+        let mut text = stringify(&lock_json, 0);
+        text.push('\n');
+        std::fs::write(lock_dir.join(format!("{}.json", tool.name)), text)
+            .map_err(|e| format!("write lockfile: {e}"))?;
+        let status = if lock.is_some() {
+            "updated"
+        } else {
+            "installed"
+        };
+        Ok((
+            status.to_string(),
+            format!(
+                "{} ({pk}) → {}",
+                tool.pinned_version.clone().unwrap_or_default(),
+                target.display()
+            ),
+        ))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// JS gcTools: remove any managed binary + lockfile whose tool is no longer required.
+fn gc_tools(keep: &[String], home: &Path) -> Vec<String> {
+    let lock_dir = home
+        .join(".agents-shared-capabilities")
+        .join("state")
+        .join("bin-lock");
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&lock_dir) else {
+        return removed;
+    };
+    for e in entries.flatten() {
+        let fname = e.file_name().to_string_lossy().to_string();
+        let Some(name) = fname.strip_suffix(".json") else {
+            continue;
+        };
+        if keep.iter().any(|k| k == name) {
+            continue;
+        }
+        if let Some(lock) = read_lock(home, name) {
+            if let Some(t) = lock.target {
+                let _ = std::fs::remove_file(&t);
+            }
+        }
+        let _ = std::fs::remove_file(lock_dir.join(&fname));
+        removed.push(name.to_string());
+    }
+    removed
 }
 
 #[cfg(test)]
