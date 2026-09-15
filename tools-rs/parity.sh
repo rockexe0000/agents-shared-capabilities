@@ -8,8 +8,10 @@
 #   2. rust  capsync --render      -> the port under test
 #   3. tests/golden/<case>/*.json  -> committed reference (catches drift in EITHER side)
 #
-# Compared files: authz-*.json (Phase 0) + openab-agent-mcp.json / runtime-mcp.json
-# (Phase 1a MCP render axis). More files join as later Phase 1 slices land.
+# Compared files: authz-*.json + authz-suggest.txt (Phase 0/1b) + openab-agent-mcp.json /
+# runtime-mcp.json (Phase 1a) + bin-install.tsv (1b) + skills.tar.b64 / skills.list (1c).
+# Also asserts `--check` parity (Phase 1d): node & rust --check on the in-sync golden exit 0,
+# and both report drift (exit != 0) against an empty dir.
 #
 # Modes:
 #   (default)      build+run rust and node, diff all three. Needs a C linker for cargo.
@@ -76,8 +78,33 @@ for capdir in "$FIXTURES"/*/; do
       if ! diff -u "$g" "$rustout/$f"; then echo "DRIFT rust vs golden: $case/$f"; fail=1; fi
     fi
   done
+
+  # --check parity: re-render + diff the committed golden → must report IN SYNC (exit 0).
+  if ! node "$SYNC" --check "$GOLDEN/$case" --capabilities "$cap" >/dev/null 2>&1; then
+    echo "CHECK node: false drift on in-sync golden: $case"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    if ! "$RUST_BIN" --check "$GOLDEN/$case" --capabilities "$cap" --catalog "$REPO" >/dev/null 2>&1; then
+      echo "CHECK rust: false drift on in-sync golden: $case"; fail=1
+    fi
+  fi
   echo "ok: $case"
 done
+
+# --check negative: an empty dir has none of the artifacts → must report drift (exit != 0).
+emptydir="$tmp/emptycheck"; mkdir -p "$emptydir"
+negcap="$FIXTURES/empty/agent/capabilities.md"
+if [ -f "$negcap" ]; then
+  if node "$SYNC" --check "$emptydir" --capabilities "$negcap" >/dev/null 2>&1; then
+    echo "CHECK node: expected drift on empty dir, got exit 0"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    if "$RUST_BIN" --check "$emptydir" --capabilities "$negcap" --catalog "$REPO" >/dev/null 2>&1; then
+      echo "CHECK rust: expected drift on empty dir, got exit 0"; fail=1
+    fi
+  fi
+  echo "ok: --check drift (negative)"
+fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
 if [ "$fail" -ne 0 ]; then echo "PARITY FAILED"; exit 1; fi
