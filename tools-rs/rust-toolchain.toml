@@ -1,7 +1,8 @@
-# Phase 0 toolchain pin (ADR 0008 Decision 2 — the binary is a managed supply-chain
-# object; its build must be reproducible). Pin the channel; CI/release will pin the
-# exact version + cross-compile targets (linux amd64/arm64 + macos) when Phase 1 wires
-# attest + sha256 pinning.
+# Toolchain pin (ADR 0008 Decision 2 — the binary is a managed supply-chain object; its
+# build must be reproducible). Phase 1g: pinned from the floating `stable` to an EXACT
+# version so every build (dev / parity CI / cross-compiled release) uses one compiler.
+# Bumping is a deliberate PR (like any pinned dependency). Cross targets are added per-job
+# in the release workflow (kept out of here so the parity CI stays lean).
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
