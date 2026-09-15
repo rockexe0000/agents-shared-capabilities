@@ -13,9 +13,9 @@
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
-//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade (1e-2a) + MCP direct
-//! claude/antigravity/opencode with the secret resolver (1e-2b). Not yet ported: codex TOML
-//! direct (1e-2c), hooks (1e-3), `--with-tools` / `--check-tools`.
+//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade (1e-2a) + MCP direct for
+//! all four runtimes incl. codex TOML, with the secret resolver (1e-2b/1e-2c). Not yet
+//! ported: hooks projection (1e-3), `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -332,6 +332,7 @@ struct ResolvedServer {
     args: Vec<Json>,
     env: Vec<(String, String)>,
     headers: Vec<(String, String)>,
+    header_env: Vec<(String, String)>, // header key → env var NAME (codex env_http_headers)
 }
 
 /// JS runCli: capture stdout (trimmed) or None on missing binary / non-zero exit.
@@ -461,17 +462,16 @@ fn resolve_server(s: &Server, env: &HashMap<String, String>) -> ResolvedServer {
         _ => Vec::new(),
     };
     let url = s.url.as_ref().map(|u| replace_braces(u, env, true));
-    let headers = s
-        .headers
-        .iter()
-        .map(|(k, v)| {
-            if v.strip_prefix("env:").filter(|n| !n.is_empty()).is_some() {
-                (k.clone(), resolve_ref(v, env).unwrap_or_default())
-            } else {
-                (k.clone(), v.clone())
-            }
-        })
-        .collect();
+    let mut headers = Vec::new();
+    let mut header_env = Vec::new();
+    for (k, v) in &s.headers {
+        if let Some(name) = v.strip_prefix("env:").filter(|n| !n.is_empty()) {
+            header_env.push((k.clone(), name.to_string()));
+            headers.push((k.clone(), resolve_ref(v, env).unwrap_or_default()));
+        } else {
+            headers.push((k.clone(), v.clone()));
+        }
+    }
     ResolvedServer {
         name: s.name.clone(),
         transport: s.transport.clone(),
@@ -480,6 +480,7 @@ fn resolve_server(s: &Server, env: &HashMap<String, String>) -> ResolvedServer {
         args,
         env: resolved_env,
         headers,
+        header_env,
     }
 }
 
@@ -656,9 +657,128 @@ fn project_opencode(direct: &[ResolvedServer], home: &Path) -> Result<(), String
     json_write_pretty(&file, &cfg)
 }
 
+// ---- codex direct projector (Phase 1e-2c) — ~/.codex/config.toml managed block ----
+const CODEX_BEGIN: &str = "# >>> agents-shared-capabilities (managed) — do not edit by hand";
+const CODEX_END: &str = "# <<< agents-shared-capabilities";
+
+/// JS q(): '"' + v.replace(/\\/g,'\\\\').replace(/"/g,'\\"') + '"'.
+fn toml_q(v: &str) -> String {
+    format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// JS String(v) for an arg value, as codex's q() sees it (numbers/bools become strings).
+fn json_scalar_string(j: &Json) -> String {
+    match j {
+        Json::Str(s) => s.clone(),
+        Json::Num(n) => n.clone(),
+        Json::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+        Json::Null => "null".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Port of codex.js toToml: one `[mcp_servers.<name>]` table per server between markers.
+fn codex_to_toml(servers: &[ResolvedServer]) -> String {
+    let mut out = vec![CODEX_BEGIN.to_string()];
+    for s in servers {
+        out.push(format!("[mcp_servers.{}]", s.name));
+        if s.transport.as_deref() == Some("http") {
+            out.push(format!(
+                "url = {}",
+                toml_q(s.url.as_deref().unwrap_or("undefined"))
+            ));
+            let env_keys: HashSet<&str> = s.header_env.iter().map(|(k, _)| k.as_str()).collect();
+            let lit: Vec<String> = s
+                .headers
+                .iter()
+                .filter(|(k, _)| !env_keys.contains(k.as_str()))
+                .map(|(k, v)| format!("{} = {}", toml_q(k), toml_q(v)))
+                .collect();
+            if !lit.is_empty() {
+                out.push(format!("http_headers = {{ {} }}", lit.join(", ")));
+            }
+            let env_h: Vec<String> = s
+                .header_env
+                .iter()
+                .map(|(k, v)| format!("{} = {}", toml_q(k), toml_q(v)))
+                .collect();
+            if !env_h.is_empty() {
+                out.push(format!("env_http_headers = {{ {} }}", env_h.join(", ")));
+            }
+        } else {
+            out.push(format!(
+                "command = {}",
+                toml_q(s.command.as_deref().unwrap_or("undefined"))
+            ));
+            let args: Vec<String> = s
+                .args
+                .iter()
+                .map(|a| toml_q(&json_scalar_string(a)))
+                .collect();
+            out.push(format!("args = [{}]", args.join(", ")));
+            let env: Vec<&(String, String)> = s.env.iter().filter(|(_, v)| !v.is_empty()).collect();
+            if !env.is_empty() {
+                out.push(format!("[mcp_servers.{}.env]", s.name));
+                for (k, v) in env {
+                    out.push(format!("{} = {}", k, toml_q(v)));
+                }
+            }
+        }
+        out.push(String::new()); // blank line after each server
+    }
+    out.push(CODEX_END.to_string());
+    out.join("\n")
+}
+
+/// JS: text.replace(/\n*BEGIN[\s\S]*?END/g, '') — remove each managed block (+ leading newlines).
+fn strip_managed_block(text: &str, begin: &str, end: &str) -> String {
+    let mut s = text.to_string();
+    while let Some(bpos) = s.find(begin) {
+        let Some(erel) = s[bpos..].find(end) else {
+            break;
+        };
+        let eend = bpos + erel + end.len();
+        let mut start = bpos;
+        while start > 0 && s.as_bytes()[start - 1] == b'\n' {
+            start -= 1;
+        }
+        s.replace_range(start..eend, "");
+    }
+    s
+}
+
+/// Port of codex.js projectMcp: strip the old managed block, append a freshly generated one.
+fn project_codex(direct: &[ResolvedServer], home: &Path) -> Result<(), String> {
+    let codex = home.join(".codex");
+    if !codex.exists() {
+        return Ok(()); // not installed
+    }
+    let file = codex.join("config.toml");
+    let text = if file.exists() {
+        let t =
+            std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let mut bak = file.clone().into_os_string();
+        bak.push(".bak");
+        let _ = std::fs::copy(&file, PathBuf::from(bak));
+        t
+    } else {
+        String::new()
+    };
+    let stripped = strip_managed_block(&text, CODEX_BEGIN, CODEX_END);
+    let stripped = stripped.trim_end(); // JS .replace(/\s+$/, '')
+    let block = codex_to_toml(direct);
+    let next = if stripped.is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{stripped}\n\n{block}\n")
+    };
+    std::fs::create_dir_all(&codex).map_err(|e| format!("mkdir {}: {e}", codex.display()))?;
+    std::fs::write(&file, next).map_err(|e| format!("write {}: {e}", file.display()))
+}
+
 /// `capsync sync`: live projection into $HOME. Phase 1e covers skills symlink (1e-1) + MCP
-/// facade route (1e-2a) + MCP direct route claude/antigravity/opencode (1e-2b); codex TOML
-/// (1e-2c) + hooks (1e-3) land later.
+/// facade (1e-2a) + MCP direct claude/antigravity/opencode (1e-2b) + codex (1e-2c); hooks
+/// (1e-3) land later.
 /// Reads $HOME/personal/capabilities.md (like sync.js's live path, NOT --capabilities).
 fn sync_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
@@ -732,8 +852,9 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
                 }
             }
         }
-        // direct projectors (codex TOML deferred to 1e-2c)
+        // direct projectors (claude / codex / antigravity / opencode — mirrors sync.js order)
         project_claude(&direct, &home)?;
+        project_codex(&direct, &home)?;
         project_antigravity(&direct, &home)?;
         project_opencode(&direct, &home)?;
         if !facade.is_empty() {

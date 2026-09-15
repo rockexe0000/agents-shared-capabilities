@@ -175,10 +175,10 @@ JSON
   fi
   echo "ok: sync (mcp facade)"
 
-  # ---- sync MCP direct axis (Phase 1e-2b) ----
+  # ---- sync MCP direct axis (Phase 1e-2b/2c) ----
   # Isolated $HOME enabling two catalog direct servers (example-fs stdio + oab-facade http),
   # no secrets set → env:/${} resolve to "". node vs rust must produce byte-identical
-  # claude/antigravity/opencode configs. (codex config.toml compared in 1e-2c.)
+  # claude/antigravity/opencode configs + codex config.toml (TOML managed block).
   make_directhome() {
     local h="$1"
     mkdir -p "$h/personal" "$h/.claude" "$h/.codex" "$h/.gemini/config" "$h/.config/opencode"
@@ -187,9 +187,10 @@ JSON
   }
   dhn="$tmp/directhome_n"; make_directhome "$dhn"
   ( cd "$REPO/tools" && HOME="$dhn" node sync.js >/dev/null 2>&1 )
-  DIRECT_FILES=(".claude.json" ".gemini/config/mcp_config.json" ".config/opencode/opencode.json")
+  DIRECT_FILES=(".claude.json" ".gemini/config/mcp_config.json" ".config/opencode/opencode.json" ".codex/config.toml")
   for f in "${DIRECT_FILES[@]}"; do
-    if ! grep -q '"example-fs"' "$dhn/$f" 2>/dev/null; then
+    # example-fs appears quoted in JSON, as [mcp_servers.example-fs] in codex TOML.
+    if ! grep -q 'example-fs' "$dhn/$f" 2>/dev/null; then
       echo "SYNC node: direct $f missing example-fs"; fail=1
     fi
   done
