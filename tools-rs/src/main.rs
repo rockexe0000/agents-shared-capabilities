@@ -13,9 +13,9 @@
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
-//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade (1e-2a) + MCP direct for
-//! all four runtimes incl. codex TOML, with the secret resolver (1e-2b/1e-2c). Not yet
-//! ported: hooks projection (1e-3), `--with-tools` / `--check-tools`.
+//! plus `sync` live projection — SKILLS symlink (1e-1), MCP facade + direct for all four
+//! runtimes incl. codex TOML with the secret resolver (1e-2), and hooks (1e-3): full parity
+//! with sync.js's live path. Not yet ported: `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -776,10 +776,252 @@ fn project_codex(direct: &[ResolvedServer], home: &Path) -> Result<(), String> {
     std::fs::write(&file, next).map_err(|e| format!("write {}: {e}", file.display()))
 }
 
-/// `capsync sync`: live projection into $HOME. Phase 1e covers skills symlink (1e-1) + MCP
-/// facade (1e-2a) + MCP direct claude/antigravity/opencode (1e-2b) + codex (1e-2c); hooks
-/// (1e-3) land later.
-/// Reads $HOME/personal/capabilities.md (like sync.js's live path, NOT --capabilities).
+// ---- hooks projection (Phase 1e-3) — port of parse.js parseHookRegistry + sync.js
+// buildHookRegistry + claude-code/antigravity projectHooks. Only effect=allow is projected;
+// a now-disabled hook is stripped from configs that still carry a previously-managed entry. ----
+
+#[derive(Clone, Default)]
+struct HookDef {
+    name: String,
+    event: Option<String>,
+    matcher: Option<String>,
+    command: Option<String>,
+}
+
+fn parse_hook_registry(text: &str) -> Vec<HookDef> {
+    let mut hooks: Vec<HookDef> = Vec::new();
+    let mut section: Option<String> = None; // "capability" | ...
+    for raw in text.split('\n') {
+        let line = trim_end(raw);
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= 2 {
+            if let Some(name) = match_item_name(t) {
+                hooks.push(HookDef {
+                    name: strip(&name),
+                    ..Default::default()
+                });
+                section = None;
+                continue;
+            }
+        }
+        let cur = match hooks.last_mut() {
+            Some(c) => c,
+            None => continue,
+        };
+        if indent == 4 {
+            if let Some(k) = match_opener(t) {
+                section = Some(k);
+                continue;
+            }
+        }
+        let (key, val) = match match_kv(t) {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if section.is_some() && indent >= 6 {
+            continue; // nested (capability) — not needed for projection
+        }
+        section = None;
+        match key.as_str() {
+            "event" => cur.event = Some(strip(&val)),
+            "matcher" => cur.matcher = Some(strip(&val)),
+            "command" => cur.command = Some(strip(&val)),
+            _ => {}
+        }
+    }
+    hooks
+}
+
+fn load_hook_registry(dir: &Path) -> Vec<HookDef> {
+    match std::fs::read_to_string(dir.join("hooks").join("registry.yaml")) {
+        Ok(t) => parse_hook_registry(&t),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn build_hook_registry(catalog: Option<&Path>, base: Option<&Path>) -> HashMap<String, HookDef> {
+    let mut map = HashMap::new();
+    if let Some(c) = catalog {
+        for h in load_hook_registry(c) {
+            map.insert(h.name.clone(), h);
+        }
+    }
+    if let Some(b) = base {
+        for h in load_hook_registry(b) {
+            map.insert(h.name.clone(), h);
+        }
+    }
+    map
+}
+
+// canonical event → runtime-native event. None = unmapped (skip), mirroring HOOK_EVENT.
+fn claude_hook_event(ev: &str) -> Option<&'static str> {
+    match ev {
+        "pre-tool" => Some("PreToolUse"),
+        "post-tool" => Some("PostToolUse"),
+        "session-start" => Some("SessionStart"),
+        "stop" => Some("Stop"),
+        "user-prompt-submit" => Some("UserPromptSubmit"),
+        _ => None,
+    }
+}
+fn antigravity_hook_event(ev: &str) -> Option<&'static str> {
+    match ev {
+        "pre-tool" => Some("PreToolUse"),
+        "post-tool" => Some("PostToolUse"),
+        "stop" => Some("Stop"),
+        _ => None,
+    }
+}
+
+fn json_get<'a>(obj: &'a Json, key: &str) -> Option<&'a Json> {
+    match obj {
+        Json::Obj(e) => e.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+        _ => None,
+    }
+}
+fn json_get_mut<'a>(obj: &'a mut Json, key: &str) -> Option<&'a mut Json> {
+    match obj {
+        Json::Obj(e) => e.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+// one hook entry's group: { [matcher?], hooks: [entry] }.
+fn hook_group(matcher: &Option<String>, entry: Json) -> Json {
+    let mut g = Vec::new();
+    if let Some(m) = matcher {
+        g.push(("matcher".to_string(), Json::Str(m.clone())));
+    }
+    g.push(("hooks".to_string(), Json::Arr(vec![entry])));
+    Json::Obj(g)
+}
+
+const HOOK_MANAGED: &str = "agents-shared-capabilities";
+
+/// Port of claude-code projectHooks: ~/.claude/settings.json `hooks`. Strip our previously
+/// managed entries (`_managedBy`), then add the enabled set. Idempotent.
+fn project_claude_hooks(hooks: &[HookDef], home: &Path) -> Result<(), String> {
+    let file = home.join(".claude").join("settings.json");
+    let exists = file.exists();
+    if !exists && hooks.is_empty() {
+        return Ok(()); // don't create an empty settings.json
+    }
+    let (mut cfg, _) = if exists {
+        json_read_for_rmw(&file)?
+    } else {
+        (Json::Obj(Vec::new()), false)
+    };
+    if let Json::Obj(top) = &mut cfg {
+        if !top.iter().any(|(k, _)| k == "hooks") {
+            top.push(("hooks".to_string(), Json::Obj(Vec::new())));
+        }
+    }
+    // 1. strip previously-managed entries, dropping now-empty groups/events.
+    if let Some(Json::Obj(hmap)) = json_get_mut(&mut cfg, "hooks") {
+        for (_ev, groups) in hmap.iter_mut() {
+            if let Json::Arr(gs) = groups {
+                let managed = Json::Str(HOOK_MANAGED.to_string());
+                let kept: Vec<Json> = gs
+                    .drain(..)
+                    .filter_map(|g| {
+                        let Json::Obj(gentries) = &g else { return None };
+                        let filtered: Vec<Json> = match gentries.iter().find(|(k, _)| k == "hooks")
+                        {
+                            Some((_, Json::Arr(items))) => items
+                                .iter()
+                                .filter(|h| json_get(h, "_managedBy") != Some(&managed))
+                                .cloned()
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        if filtered.is_empty() {
+                            return None;
+                        }
+                        let mut ng = gentries.clone();
+                        json_upsert(&mut ng, "hooks", Json::Arr(filtered));
+                        Some(Json::Obj(ng))
+                    })
+                    .collect();
+                *groups = Json::Arr(kept);
+            }
+        }
+        hmap.retain(|(_k, v)| !matches!(v, Json::Arr(a) if a.is_empty()));
+    }
+    // 2. add enabled hooks.
+    for h in hooks {
+        let Some(native) = h.event.as_deref().and_then(claude_hook_event) else {
+            continue;
+        };
+        let mut entry = vec![("type".to_string(), Json::Str("command".to_string()))];
+        if let Some(c) = &h.command {
+            entry.push(("command".to_string(), Json::Str(c.clone())));
+        }
+        entry.push((
+            "_managedBy".to_string(),
+            Json::Str(HOOK_MANAGED.to_string()),
+        ));
+        entry.push(("_hook".to_string(), Json::Str(h.name.clone())));
+        let group = hook_group(&h.matcher, Json::Obj(entry));
+        if let Some(Json::Obj(hmap)) = json_get_mut(&mut cfg, "hooks") {
+            if !hmap.iter().any(|(k, _)| k == native) {
+                hmap.push((native.to_string(), Json::Arr(Vec::new())));
+            }
+            if let Some((_, Json::Arr(arr))) = hmap.iter_mut().find(|(k, _)| k == native) {
+                arr.push(group);
+            }
+        }
+    }
+    // if the hooks map ended up empty, drop the key entirely.
+    if let Json::Obj(top) = &mut cfg {
+        let empty = matches!(top.iter().find(|(k, _)| k == "hooks"), Some((_, Json::Obj(e))) if e.is_empty());
+        if empty {
+            top.retain(|(k, _)| k != "hooks");
+        }
+    }
+    json_write_pretty(&file, &cfg)
+}
+
+/// Port of antigravity projectHooks: ~/.gemini/config/hooks.json keyed by `asc:<name>`.
+/// Strip our `asc:` keys, then re-add the enabled set.
+fn project_antigravity_hooks(hooks: &[HookDef], home: &Path) -> Result<(), String> {
+    let file = home.join(".gemini").join("config").join("hooks.json");
+    let exists = file.exists();
+    if !exists && hooks.is_empty() {
+        return Ok(());
+    }
+    let (mut cfg, _) = if exists {
+        json_read_for_rmw(&file)?
+    } else {
+        (Json::Obj(Vec::new()), false)
+    };
+    if let Json::Obj(top) = &mut cfg {
+        top.retain(|(k, _)| !k.starts_with("asc:"));
+    }
+    for h in hooks {
+        let Some(native) = h.event.as_deref().and_then(antigravity_hook_event) else {
+            continue;
+        };
+        let mut entry = vec![("type".to_string(), Json::Str("command".to_string()))];
+        if let Some(c) = &h.command {
+            entry.push(("command".to_string(), Json::Str(c.clone())));
+        }
+        let group = hook_group(&h.matcher, Json::Obj(entry));
+        let value = Json::Obj(vec![(native.to_string(), Json::Arr(vec![group]))]);
+        if let Json::Obj(top) = &mut cfg {
+            json_upsert(top, &format!("asc:{}", h.name), value);
+        }
+    }
+    json_write_pretty(&file, &cfg)
+}
+
+/// `capsync sync`: live projection into $HOME. Phase 1e covers skills symlink (1e-1), MCP
+/// facade + direct all four runtimes (1e-2), and hooks (1e-3) — full parity with sync.js's
+/// live path. Reads $HOME/personal/capabilities.md (like sync.js, NOT --capabilities).
 fn sync_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
     let catalog = resolve_catalog(args);
@@ -862,6 +1104,31 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
         }
         println!("[mcp] direct: {} · facade: {}", direct.len(), facade.len());
     }
+
+    // ---- hooks (ADR 0005) — only effect=allow is projected; the projectors always run (even
+    // with an empty set) so a now-disabled hook is stripped. Each gates on runtime install. ----
+    let resolved_hooks: Vec<HookDef> = {
+        let registry = build_hook_registry(catalog.as_deref(), base.as_deref());
+        enable
+            .hooks
+            .iter()
+            .filter(|h| h.effect == "allow")
+            .filter_map(|want| match registry.get(&want.name) {
+                Some(def) => Some(def.clone()),
+                None => {
+                    println!("  hook {}: ERROR not in hook registry", want.name);
+                    None
+                }
+            })
+            .collect()
+    };
+    if home.join(".claude").exists() || home.join(".claude.json").exists() {
+        project_claude_hooks(&resolved_hooks, &home)?;
+    }
+    if home.join(".gemini").exists() {
+        project_antigravity_hooks(&resolved_hooks, &home)?;
+    }
+    println!("[hooks] projected: {}", resolved_hooks.len());
     Ok(())
 }
 
@@ -1165,7 +1432,7 @@ fn stringify_authz(m: &Mapped) -> String {
     s
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 enum Json {
     Str(String),
     Num(String), // verbatim token; V8 number canonicalization is not reproduced (unused by MCP args)
@@ -1439,6 +1706,7 @@ fn parse_args(val: &str) -> Json {
 struct Enable {
     skills: Vec<EnableSkill>,
     mcp: Vec<EnableMcp>,
+    hooks: Vec<EnableHook>,
 }
 struct EnableSkill {
     name: String,
@@ -1446,6 +1714,10 @@ struct EnableSkill {
 }
 struct EnableMcp {
     name: String,
+}
+struct EnableHook {
+    name: String,
+    effect: String, // "allow" | "deny" (default allow)
 }
 
 fn parse_enable(file: &Path) -> Enable {
@@ -1489,10 +1761,75 @@ fn parse_enable(file: &Path) -> Enable {
                     }
                 }
             }
+            Some("hooks") => {
+                if let Some((name, effect)) = match_hook_inline(raw) {
+                    out.hooks.push(EnableHook { name, effect });
+                } else if let Some(effect) = match_effect(raw) {
+                    if let Some(last) = out.hooks.last_mut() {
+                        last.effect = effect;
+                    }
+                }
+            }
             _ => {}
         }
     }
     out
+}
+
+/// JS: /^\s*-\s*\{?\s*name:\s*([A-Za-z0-9_-]+)(?:.*effect:\s*(allow|deny))?/ — hook item
+/// (block or inline), effect defaults to "allow".
+fn match_hook_inline(raw: &str) -> Option<(String, String)> {
+    let r = raw.trim_start();
+    let r = r.strip_prefix('-')?;
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix('{').unwrap_or(r);
+    let r = r.trim_start_matches([' ', '\t']);
+    let after = r.strip_prefix("name:")?;
+    let after = after.trim_start_matches([' ', '\t']);
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    let effect = find_effect(&after[name.len()..]).unwrap_or_else(|| "allow".to_string());
+    Some((name, effect))
+}
+
+/// JS greedy `.*effect:\s*(allow|deny)` — the last `effect:` followed by allow/deny.
+fn find_effect(s: &str) -> Option<String> {
+    let mut result = None;
+    let mut idx = 0;
+    while let Some(p) = s[idx..].find("effect:") {
+        let start = idx + p + "effect:".len();
+        let v = s[start..].trim_start_matches([' ', '\t']);
+        for kw in ["allow", "deny"] {
+            if v.strip_prefix(kw).is_some() {
+                result = Some(kw.to_string());
+            }
+        }
+        idx = start;
+    }
+    result
+}
+
+/// JS: /^\s*effect:\s*(allow|deny)\b/ group 1 (block-form effect line).
+fn match_effect(raw: &str) -> Option<String> {
+    let r = raw.trim_start().strip_prefix("effect:")?;
+    let r = r.trim_start_matches([' ', '\t']);
+    for kw in ["allow", "deny"] {
+        if let Some(after) = r.strip_prefix(kw) {
+            if after
+                .chars()
+                .next()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+            {
+                return Some(kw.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// JS: raw.match(/^\s*-\s*name:\s*(\S[^\n]*?)\s*$/) group 1 — skill item name (block form;
