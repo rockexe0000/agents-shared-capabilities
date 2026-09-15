@@ -138,6 +138,42 @@ if [ "$MODE" != "update-golden" ]; then
     fi
   fi
   echo "ok: sync (skills symlink)"
+
+  # ---- sync MCP facade axis (Phase 1e-2a) ----
+  # Isolated $HOME enabling a catalog facade server (octobroker), with a PRE-EXISTING
+  # ~/.openab/agent/mcp.json (extra top-level key + a preexisting server) so we also exercise
+  # the read-modify-write merge. node vs rust must produce a byte-identical mcp.json.
+  make_facadehome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/.openab/agent" "$h/.claude" "$h/.codex" "$h/.gemini/antigravity-cli" "$h/.config/opencode"
+    printf 'skills:\nmcp:\n  servers:\n    - name: octobroker\nhooks:\n' > "$h/personal/capabilities.md"
+    cat > "$h/.openab/agent/mcp.json" <<'JSON'
+{
+  "someOtherKey": "keep-me",
+  "mcpServers": {
+    "preexisting": {
+      "type": "stdio",
+      "command": "foo",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+JSON
+  }
+  fhn="$tmp/facadehome_n"; make_facadehome "$fhn"
+  ( cd "$REPO/tools" && HOME="$fhn" node sync.js >/dev/null 2>&1 )
+  if ! grep -q '"octobroker"' "$fhn/.openab/agent/mcp.json" || ! grep -q '"keep-me"' "$fhn/.openab/agent/mcp.json"; then
+    echo "SYNC node: facade mcp.json missing octobroker or dropped existing key"; cat "$fhn/.openab/agent/mcp.json"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    fhr="$tmp/facadehome_r"; make_facadehome "$fhr"
+    HOME="$fhr" "$RUST_BIN" sync --catalog "$REPO" >/dev/null 2>&1
+    if ! diff -u "$fhn/.openab/agent/mcp.json" "$fhr/.openab/agent/mcp.json"; then
+      echo "SYNC rust vs node facade mcp.json drift"; fail=1
+    fi
+  fi
+  echo "ok: sync (mcp facade)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi

@@ -13,8 +13,9 @@
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
-//! plus `sync` live projection — SKILLS symlink axis (Phase 1e-1). Not yet ported: live MCP
-//! merge + hooks projection (1e-2/3), `--with-tools` / `--check-tools`.
+//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade route (1e-2a). Not yet
+//! ported: MCP direct projectors + secret resolver (1e-2b), hooks (1e-3), `--with-tools` /
+//! `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -264,7 +265,62 @@ fn link_skill(rt_base: &Path, skills_dir: &Path, name: &str, src: &Path) -> Stri
     }
 }
 
-/// `capsync sync`: live projection into $HOME. Phase 1e-1 = skills symlink axis only.
+/// Upsert key→val into a JSON object's entries: overwrite in place on collision (preserving
+/// position), else append. Mirrors JS `obj[key] = val`.
+fn json_upsert(entries: &mut Vec<(String, Json)>, key: &str, val: Json) {
+    if let Some(e) = entries.iter_mut().find(|(k, _)| k == key) {
+        e.1 = val;
+    } else {
+        entries.push((key.to_string(), val));
+    }
+}
+
+/// Port of oab-facade projectMcp: SAFE read-modify-write of ~/.openab/agent/mcp.json — parse
+/// existing (lossless), .bak backup, set only our server keys under `mcpServers` via
+/// shapeServer (secrets stay ${env:} refs), re-emit as JSON.stringify(_, null, 2)+"\n".
+fn project_facade(servers: &[Server], home: &Path) -> Result<(), String> {
+    let file = home.join(".openab").join("agent").join("mcp.json");
+    let mut cfg = if file.exists() {
+        let text =
+            std::fs::read_to_string(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let mut bak = file.clone().into_os_string();
+        bak.push(".bak");
+        let _ = std::fs::copy(&file, PathBuf::from(bak));
+        match parse_json(&text) {
+            Ok(j @ Json::Obj(_)) => j,
+            _ => Json::Obj(Vec::new()),
+        }
+    } else {
+        Json::Obj(Vec::new())
+    };
+    let top = match &mut cfg {
+        Json::Obj(e) => e,
+        _ => unreachable!(),
+    };
+    // cfg.mcpServers = cfg.mcpServers || {}
+    if !top.iter().any(|(k, _)| k == "mcpServers") {
+        top.push(("mcpServers".to_string(), Json::Obj(Vec::new())));
+    }
+    let ms = top.iter_mut().find(|(k, _)| k == "mcpServers").unwrap();
+    if !matches!(ms.1, Json::Obj(_)) {
+        ms.1 = Json::Obj(Vec::new());
+    }
+    if let Json::Obj(inner) = &mut ms.1 {
+        for s in servers {
+            json_upsert(inner, &s.name, shape_server(s));
+        }
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let mut out = stringify(&cfg, 0);
+    out.push('\n');
+    std::fs::write(&file, out).map_err(|e| format!("write {}: {e}", file.display()))?;
+    Ok(())
+}
+
+/// `capsync sync`: live projection into $HOME. Phase 1e covers skills symlink (1e-1) + MCP
+/// facade route (1e-2a); direct-route MCP + hooks land in later 1e sub-slices.
 /// Reads $HOME/personal/capabilities.md (like sync.js's live path, NOT --capabilities).
 fn sync_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
@@ -311,6 +367,40 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
                 "  [{id}] {}: {}",
                 s.name,
                 link_skill(&rt_base, &skills_dir, &s.name, &src)
+            );
+        }
+    }
+
+    // ---- MCP: facade route only (Phase 1e-2a). direct route (runtime configs) + secret
+    // resolver land in 1e-2b, so direct-route servers are noted and skipped here. ----
+    if !enable.mcp.is_empty() {
+        let registry = build_registry(catalog.as_deref(), base.as_deref());
+        let mut facade: Vec<Server> = Vec::new();
+        for want in &enable.mcp {
+            match registry.get(&want.name) {
+                None => println!("  mcp {}: ERROR not in registry", want.name),
+                Some(def) => {
+                    if def.route.as_deref().unwrap_or(DEFAULT_ROUTE) == "direct" {
+                        println!(
+                            "  mcp {}: route=direct (deferred to Phase 1e-2b)",
+                            want.name
+                        );
+                    } else {
+                        facade.push(def.clone());
+                        println!("  mcp {}: route=facade", want.name);
+                    }
+                }
+            }
+        }
+        if !facade.is_empty() {
+            project_facade(&facade, &home)?;
+            println!(
+                "[oab-facade] registered {} → ~/.openab/agent/mcp.json",
+                facade
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
     }
