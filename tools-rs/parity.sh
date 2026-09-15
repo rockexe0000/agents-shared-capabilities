@@ -243,6 +243,69 @@ JSON
   echo "ok: sync (hooks)"
 fi
 
+# ---- --check-tools parity (Phase 1f-1) ----
+# Hermetic bin drift check: a personal skill requires a personal bin tool; a hand-crafted
+# lockfile + fake installed binary. No network. node vs rust must agree on the exit code:
+# OK (matching lock) → 0; after tampering the binary → drift (1). Cross-checks that rust's
+# SHA-256 == node crypto == sha256sum.
+if [ "$MODE" != "update-golden" ]; then
+  sha256of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+  case "$(uname -s)" in Linux) tos=linux;; Darwin) tos=macos;; *) tos=$(uname -s);; esac
+  case "$(uname -m)" in x86_64) tarch=amd64;; aarch64|arm64) tarch=arm64;; *) tarch=$(uname -m);; esac
+  pk="$tos-$tarch"
+  make_toolhome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/skills/demo-skill" "$h/bin" \
+      "$h/.agents-shared-capabilities/state/bin-lock" "$h/.local/bin"
+    printf 'skills:\n  - name: demo-skill\n    source: personal\nmcp:\n  servers:\nhooks:\n' \
+      > "$h/personal/capabilities.md"
+    printf -- '---\nname: demo-skill\ndescription: x\nrequires:\n  - name: demotool\n---\n# demo\n' \
+      > "$h/skills/demo-skill/SKILL.md"
+    cat > "$h/bin/registry.yaml" <<REG
+tools:
+  - name: demotool
+    pinned-version: v1
+    bin: demotool
+    archive: raw
+    url: "https://example/demotool"
+    platforms:
+      $pk:
+        asset: demotool-$pk
+        sha256: assetsha000
+REG
+    printf 'FAKEBIN\n' > "$h/.local/bin/demotool"
+    local binsha; binsha="$(sha256of "$h/.local/bin/demotool")"
+    cat > "$h/.agents-shared-capabilities/state/bin-lock/demotool.json" <<LOCK
+{
+  "name": "demotool",
+  "pinned-version": "v1",
+  "platform": "$pk",
+  "asset": "demotool-$pk",
+  "asset-sha256": "assetsha000",
+  "bin-sha256": "$binsha",
+  "target": "$h/.local/bin/demotool",
+  "bin": "demotool"
+}
+LOCK
+  }
+  thn="$tmp/toolhome_n"; make_toolhome "$thn"
+  # capture exit codes without tripping `set -e` (drift returns non-zero by design).
+  n_ok=0; ( cd "$REPO/tools" && HOME="$thn" node sync.js --check-tools --capabilities "$thn/personal/capabilities.md" >/dev/null 2>&1 ) || n_ok=$?
+  [ "$n_ok" -eq 0 ] || { echo "CHECK-TOOLS node: expected exit 0 (in sync), got $n_ok"; fail=1; }
+  printf 'TAMPERED\n' > "$thn/.local/bin/demotool"
+  n_tam=0; ( cd "$REPO/tools" && HOME="$thn" node sync.js --check-tools --capabilities "$thn/personal/capabilities.md" >/dev/null 2>&1 ) || n_tam=$?
+  [ "$n_tam" -ne 0 ] || { echo "CHECK-TOOLS node: expected drift after tamper, got 0"; fail=1; }
+  if [ "$MODE" = "full" ]; then
+    thr="$tmp/toolhome_r"; make_toolhome "$thr"
+    r_ok=0; HOME="$thr" "$RUST_BIN" --check-tools --capabilities "$thr/personal/capabilities.md" --catalog "$REPO" >/dev/null 2>&1 || r_ok=$?
+    [ "$r_ok" -eq "$n_ok" ] || { echo "CHECK-TOOLS rust in-sync exit $r_ok != node $n_ok"; fail=1; }
+    printf 'TAMPERED\n' > "$thr/.local/bin/demotool"
+    r_tam=0; HOME="$thr" "$RUST_BIN" --check-tools --capabilities "$thr/personal/capabilities.md" --catalog "$REPO" >/dev/null 2>&1 || r_tam=$?
+    [ "$r_tam" -eq "$n_tam" ] || { echo "CHECK-TOOLS rust tamper exit $r_tam != node $n_tam"; fail=1; }
+  fi
+  echo "ok: --check-tools (in-sync + tamper)"
+fi
+
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
 if [ "$fail" -ne 0 ]; then echo "PARITY FAILED"; exit 1; fi
 echo "PARITY OK ($MODE)"
