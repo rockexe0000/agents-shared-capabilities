@@ -59,7 +59,13 @@ jobs:
           cp "target/${{ matrix.target }}/release/capsync" "$out"
           if command -v sha256sum >/dev/null 2>&1; then sha256sum "$out" > "$out.sha256"; else shasum -a 256 "$out" > "$out.sha256"; fi
           cat "$out.sha256"
+      # Best-effort provenance. GitHub attestation is unavailable for USER-owned private repos
+      # (works for public, or org-owned on Team+). Skip it there so the release still ships;
+      # sha256 is the load-bearing verify for consumers (ADR 0006 treats no-attestation as an
+      # explicit downgrade). It auto-enables if the repo becomes public / org-owned.
       - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        continue-on-error: true
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: tools-rs/capsync-${{ matrix.target }}
