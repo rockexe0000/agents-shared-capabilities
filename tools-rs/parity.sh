@@ -202,6 +202,45 @@ JSON
     done
   fi
   echo "ok: sync (mcp direct)"
+
+  # ---- sync hooks axis (Phase 1e-3) ----
+  # Enable a catalog hook (post-edit-noop). claude settings.json is PRE-SEEDED with a
+  # user-authored hook + a stale managed entry → exercises strip-managed + keep-user + re-add;
+  # antigravity hooks.json is fresh. node vs rust must produce byte-identical files.
+  make_hookhome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/.claude" "$h/.gemini/config"
+    printf 'skills:\nmcp:\n  servers:\nhooks:\n  - name: post-edit-noop\n    effect: allow\n' \
+      > "$h/personal/capabilities.md"
+    cat > "$h/.claude/settings.json" <<'JSON'
+{
+  "model": "sonnet",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [ { "type": "command", "command": "user-hook" } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [ { "type": "command", "command": "stale", "_managedBy": "agents-shared-capabilities", "_hook": "old" } ] }
+    ]
+  }
+}
+JSON
+  }
+  hhn="$tmp/hookhome_n"; make_hookhome "$hhn"
+  ( cd "$REPO/tools" && HOME="$hhn" node sync.js >/dev/null 2>&1 )
+  HOOK_FILES=(".claude/settings.json" ".gemini/config/hooks.json")
+  if ! grep -q 'post-edit-noop' "$hhn/.claude/settings.json" || ! grep -q 'user-hook' "$hhn/.claude/settings.json" \
+     || grep -q '"command": "stale"' "$hhn/.claude/settings.json"; then
+    echo "SYNC node: claude hooks strip/keep/add wrong"; cat "$hhn/.claude/settings.json"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    hhr="$tmp/hookhome_r"; make_hookhome "$hhr"
+    HOME="$hhr" "$RUST_BIN" sync --catalog "$REPO" >/dev/null 2>&1
+    for f in "${HOOK_FILES[@]}"; do
+      if ! diff -u "$hhn/$f" "$hhr/$f"; then echo "SYNC rust vs node hooks drift: $f"; fail=1; fi
+    done
+  fi
+  echo "ok: sync (hooks)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
