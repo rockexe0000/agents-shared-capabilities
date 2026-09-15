@@ -304,6 +304,52 @@ LOCK
     [ "$r_tam" -eq "$n_tam" ] || { echo "CHECK-TOOLS rust tamper exit $r_tam != node $n_tam"; fail=1; }
   fi
   echo "ok: --check-tools (in-sync + tamper)"
+
+  # ---- sync --with-tools parity (Phase 1f-2) ----
+  # Hermetic install: a fake tar.gz served over a file:// URL (no real network). node vs rust
+  # must install the identical binary and write matching lockfiles (modulo the per-home target).
+  fake="$tmp/fakeasset"; mkdir -p "$fake/stage"
+  printf '#!/bin/sh\necho demotool\n' > "$fake/stage/demotool"
+  ( cd "$fake/stage" && tar -czf "$fake/demotool-$pk.tar.gz" demotool )
+  asset_sha="$(sha256of "$fake/demotool-$pk.tar.gz")"
+  make_installhome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/skills/demo-skill" "$h/bin" "$h/installed"
+    printf 'skills:\n  - name: demo-skill\n    source: personal\nmcp:\n  servers:\nhooks:\n' \
+      > "$h/personal/capabilities.md"
+    printf -- '---\nname: demo-skill\ndescription: x\nrequires:\n  - name: demotool\n---\n# demo\n' \
+      > "$h/skills/demo-skill/SKILL.md"
+    cat > "$h/bin/registry.yaml" <<REG
+tools:
+  - name: demotool
+    pinned-version: v1
+    bin: demotool
+    archive: tar.gz
+    url: "file://$fake/\${asset}"
+    platforms:
+      $pk:
+        asset: demotool-$pk.tar.gz
+        sha256: $asset_sha
+REG
+  }
+  ihn="$tmp/installhome_n"; make_installhome "$ihn"
+  # node: live sync is the default action; --with-tools opts into the bin installer.
+  ( cd "$REPO/tools" && HOME="$ihn" BIN_INSTALL_DIR="$ihn/installed" node sync.js --with-tools >/dev/null 2>&1 ) || true
+  n_lock="$ihn/.agents-shared-capabilities/state/bin-lock/demotool.json"
+  if [ ! -x "$ihn/installed/demotool" ] || [ ! -f "$n_lock" ]; then
+    echo "WITH-TOOLS node: demotool not installed / no lockfile"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    ihr="$tmp/installhome_r"; make_installhome "$ihr"
+    HOME="$ihr" BIN_INSTALL_DIR="$ihr/installed" "$RUST_BIN" sync --with-tools --catalog "$REPO" >/dev/null 2>&1 || true
+    r_lock="$ihr/.agents-shared-capabilities/state/bin-lock/demotool.json"
+    if ! diff "$ihn/installed/demotool" "$ihr/installed/demotool"; then echo "WITH-TOOLS installed binary drift"; fail=1; fi
+    # lockfiles must match except the per-home absolute target path.
+    if ! diff <(grep -v '"target"' "$n_lock") <(grep -v '"target"' "$r_lock"); then
+      echo "WITH-TOOLS lockfile drift (modulo target)"; fail=1
+    fi
+  fi
+  echo "ok: sync --with-tools (install)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
