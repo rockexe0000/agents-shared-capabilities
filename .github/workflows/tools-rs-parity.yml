@@ -1,4 +1,4 @@
-name: tooling-rs-parity
+name: tools-rs-parity
 
 # ADR 0008 Phase 0/1 gate: the Rust `capsync` port must stay byte-for-byte identical to
 # `tools/sync.js --render` (authz axis for the spike; more axes as Phase 1 lands). Runs on

@@ -1,14 +1,17 @@
-name: tooling-rs-release
+name: tools-rs-release
 
 # ADR 0008 Decision 2 + Phase 1g — treat capsync as a managed supply-chain object: build it
 # reproducibly for every target we run on, publish a sha256 for each artifact, and attach a
 # build-provenance attestation (the same governance ADR 0006 applies to EXTERNAL bins, applied
 # to our own). Consumers (Phase 2 ephemeral init) fetch a pinned release + verify the sha256.
 #
-# Trigger: a `tooling-rs-v*` tag (e.g. tooling-rs-v0.1.0) or a manual dispatch.
+# Trigger: a `v*` tag (e.g. v0.1.0) or a manual dispatch. capsync is the repo's only
+# release artifact, and the catalog is consumed by pinned git ref (ADR 0008 Decision 3) — not
+# by a release version — so a repo-wide `v*` tag is unambiguous and ties the binary to the
+# exact catalog it was built against. Namespace the tag only if a second artifact ever ships.
 on:
   push:
-    tags: ['tooling-rs-v*']
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
