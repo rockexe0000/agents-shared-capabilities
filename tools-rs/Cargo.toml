@@ -2,7 +2,7 @@
 name = "capsync"
 version = "0.0.0"
 edition = "2021"
-description = "ADR 0008 Phase 0 spike: single-file, runtime-portable capability tooling. Currently implements the authz axis of --render at byte-for-byte parity with tools/sync.js."
+description = "ADR 0008: single-file, runtime-portable capability tooling (render/check/sync/check-tools) at byte-for-byte parity with tools/sync.js."
 publish = false
 
 [[bin]]

@@ -1,84 +1,75 @@
 # tools-rs — capability tooling, Rust port (ADR 0008)
 
-Single-file, runtime-portable reimplementation of `tools/` (the capability
-projection tooling). This is the **Phase 0 spike** of ADR 0008 (tooling Rust
-unification + on-pod render): it exists to de-risk the rewrite, not to replace
-`tools/` yet. Node/sh stays canonical until per-axis byte-for-byte parity is proven.
+`capsync`: a single-file, runtime-portable reimplementation of `tools/` (the capability
+projection tooling). ADR 0008 unifies the node + POSIX-sh backends into one static binary.
+During migration `tools-rs/` runs **parallel** to `tools/` — node/sh stays canonical until
+per-axis byte-for-byte parity is proven, then node is removed (Phase 4).
 
 Decision WHY / trade-offs: `agents-cold-memory:shared/adr/0008-tooling-rust-unification`.
-Implementation work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooling-rust-unification`).
+Work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooling-rust-unification`).
 
-## Scope of the spike
+## Scope (current)
 
-Implements **`--render` for the authorization axis only** (閘 2, ADR 0007):
+`capsync` mirrors `tools/sync.js` at byte-for-byte parity, all JSON emitted as
+`JSON.stringify(x, null, 2) + "\n"` via a hand-rolled serializer:
 
-```
-permissions.md  →  {allow, deny}  →  per-runtime tokens  →  authz-<runtime>.json
-```
+| command | what it does |
+|---------|--------------|
+| `--render <dir> [--capabilities <f>] [--catalog <d>]` | write every artifact off-pod: `authz-*.json` + `authz-suggest.txt`, `openab-agent-mcp.json` (facade) + `runtime-mcp.json` (direct), `bin-install.tsv`, `skills.tar.b64` + `skills.list` |
+| `--check <dir> …` | re-render + diff committed artifacts; exit 1 on drift |
+| `sync [--with-tools] [--catalog <d>]` | live projection into `$HOME`: skills symlinks, MCP merge into each runtime config (claude-code/codex/antigravity/opencode + oab-facade), hooks (claude/antigravity); `--with-tools` also fetches+verifies the pinned bin CLIs enabled skills `require` |
+| `--check-tools …` | verify installed bin tools vs the registry (drift → exit 1); no network |
 
-Target: **byte-for-byte identical** to `tools/sync.js --render`'s
-`authz-antigravity.json` and `authz-claude-code.json`. The code is a deliberate
-port of `tools/lib/parse.js` (`parsePermissions` / `strip` / `stripComment`) and
-`tools/lib/authz.js` (`buildAuthz` / `mapAuthz`), down to emitting
-`JSON.stringify(obj, null, 2) + "\n"` via a hand-rolled serializer.
-
-**Intentionally NOT in the spike** (Phase 1 territory — see the handoff):
-
-- `authz-suggest.txt` and `authorize_skill_requires: auto` grant-derivation. Both
-  need the enable-list + bin-tools registry (`loadBinTools` / `requiredToolNames`).
-  The flag is parsed and honored, but no `requires`-derived suggestions are
-  synthesized. This does not change the two JSON files when no skill is enabled
-  (see the `auto-no-skills` fixture).
-- The other axes: mcp (facade/direct), bin (TSV), skills (tar), hooks.
-- `--check`, `--with-tools`, `--check-tools`, cross-compile + attest + sha256 pin.
-
-## Phase 0 toolchain decisions (ADR 0008 Decision 1–2)
-
-- **Zero external crates.** The authz artifact is a fixed-shape object of string
-  arrays; a hand-rolled printer that mirrors `JSON.stringify(x, null, 2)` is smaller
-  and safer for parity than pulling `serde_json` (whose escaping / key-order we'd
-  have to re-verify against V8 anyway). Revisit only when an axis needs real JSON
-  *parsing*.
-- **Toolchain pinned** via `rust-toolchain.toml` (`channel = "stable"`). Phase 1
-  pins the exact version + cross-compile targets (linux amd64/arm64 + macos) and
-  wires attest + sha256 pinning per ADR 0006.
-- **Layout: `tools-rs/` sits beside `tools/`,** both live during migration; the
-  parity gate protects the switch.
+`--catalog <dir>` points at a local checkout of this catalog repo (`sync.js` infers it from
+`__dirname`; a standalone binary can't, so it's an explicit flag — falls back to an exe-relative
+guess). Ports `tools/lib/{parse,authz,install-bin}.js`, `tools/sync.js`, `tools/projectors/*`.
 
 ## Build / test / parity
 
 ```sh
 cd tools-rs
-cargo test                 # unit tests (parse / build / json shape)
+cargo test                    # unit tests (parsers / json / sha256 / base64 / shapes)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-./parity.sh                # build rust + run node, diff both vs committed golden
-./parity.sh --node-only    # skip the rust half (env without a C linker)
-./parity.sh --update-golden  # regenerate golden from node (maintenance)
+./parity.sh                   # build rust + run node, diff both vs committed golden
+./parity.sh --node-only       # skip the rust half (env without a C linker)
+./parity.sh --update-golden   # regenerate golden from node (maintenance)
 ```
 
-The parity gate renders every fixture under `tests/fixtures/<case>/` three ways —
-node, rust, and the committed `tests/golden/<case>/` — and fails on any diff, so a
-regression in **either** implementation is caught. CI runs the full gate on
-`ubuntu-latest` (`.github/workflows/tooling-rs-parity.yml`); that runner has the C
-toolchain the Rust link step needs.
+The gate renders every fixture under `tests/fixtures/<case>/` three ways — node, rust, and the
+committed `tests/golden/<case>/` — and fails on any diff, so a regression in **either** side is
+caught. It also exercises the stateful paths in isolated `$HOME`s (live `sync` skills/MCP/hooks,
+`--check`, `--check-tools`, `--with-tools` via a `file://` fake asset) comparing node vs rust.
+CI runs the full gate on `ubuntu-latest` (`.github/workflows/tooling-rs-parity.yml`).
 
-> Note: a linker-less environment (no `cc`/`gcc`, no dev libc) can still run
-> `cargo check`, `cargo fmt`, `cargo clippy`, and `./parity.sh --node-only`, but
-> not `cargo test` / `cargo build` / the full parity (all require linking). The
-> spike was authored under exactly that constraint; the executing byte-for-byte
-> comparison of both sides runs in CI.
+> A linker-less environment (no `cc`/`gcc`) can still run `cargo check`, `fmt`, `clippy`, and
+> `./parity.sh --node-only`, but not `cargo test`/`build`/full parity (all require linking). The
+> executing rust-vs-node byte comparison runs in CI.
+
+## Supply chain (ADR 0008 Decision 2 / ADR 0006 template)
+
+`capsync` is a managed supply-chain object: reproducible build, pinned + verifiable.
+
+- **Toolchain pinned** to an exact version in `rust-toolchain.toml` (not floating `stable`);
+  bumping is a deliberate PR. `Cargo.lock` is committed; release builds use `--locked`.
+- **Release** (`.github/workflows/tooling-rs-release.yml`, on a `tooling-rs-v*` tag):
+  cross-compiles static musl linux (amd64/arm64) + macos (arm64/x86_64), publishes each
+  artifact's **sha256** + a **build-provenance attestation** (`actions/attest-build-provenance`).
+- **Consumers** (Phase 2 ephemeral init) fetch a pinned release asset and verify its sha256
+  before running it — the same governance ADR 0006 applies to external bins, applied to our own.
 
 ## Fixtures
 
-`tests/fixtures/<case>/agent/{capabilities,permissions}.md` drive the gate (the
-subdir is `agent/`, not `personal/`, because the repo `.gitignore` excludes
-`**/personal/` for real agent namespaces):
+`tests/fixtures/<case>/agent/{capabilities,permissions}.md` drive the gate (subdir `agent/`,
+not `personal/`, because `.gitignore` excludes `**/personal/`). Some cases add `mcp/`, `bin/`,
+`skills/` for the personal-namespace paths.
 
 | case | exercises |
 |------|-----------|
-| `single-allow`    | the real deployed shape (allow `cfdrop` only) |
-| `deny-override`   | deny removes a command from allow; `ask` left unprojected; sort |
-| `quotes-comments` | double/single-quote stripping, inline `#` comment stripping, dedup |
-| `spaces`          | command token with a space (JSON + sort) |
-| `empty`           | no `run command` rules → `{"allow":[],"deny":[]}` |
-| `auto-no-skills`  | `auto` flag with no skills → JSON unchanged vs explicit |
+| `single-allow` / `deny-override` / `quotes-comments` / `spaces` / `empty` | authz: allow/deny/sort, quote+comment stripping, dedup, empty |
+| `auto-no-skills` | `authorize_skill_requires: auto` with no skills |
+| `mcp-basic`   | MCP render: facade stdio + direct http, `env:` → `${env:}` |
+| `bin-basic`   | bin `requires` closure → `bin-install.tsv`; `auto` allow derivation + suggest |
+| `skills-multi`| skills tar (sorted, nested dir) → `skills.tar.b64` + `skills.list` |
+
+(The stateful `sync` / `--check-tools` / `--with-tools` scenarios are built inline by
+`parity.sh` in isolated `$HOME`s rather than as committed fixtures.)
