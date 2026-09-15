@@ -174,6 +174,33 @@ JSON
     fi
   fi
   echo "ok: sync (mcp facade)"
+
+  # ---- sync MCP direct axis (Phase 1e-2b) ----
+  # Isolated $HOME enabling two catalog direct servers (example-fs stdio + oab-facade http),
+  # no secrets set → env:/${} resolve to "". node vs rust must produce byte-identical
+  # claude/antigravity/opencode configs. (codex config.toml compared in 1e-2c.)
+  make_directhome() {
+    local h="$1"
+    mkdir -p "$h/personal" "$h/.claude" "$h/.codex" "$h/.gemini/config" "$h/.config/opencode"
+    printf 'skills:\nmcp:\n  servers:\n    - name: example-fs\n    - name: oab-facade\nhooks:\n' \
+      > "$h/personal/capabilities.md"
+  }
+  dhn="$tmp/directhome_n"; make_directhome "$dhn"
+  ( cd "$REPO/tools" && HOME="$dhn" node sync.js >/dev/null 2>&1 )
+  DIRECT_FILES=(".claude.json" ".gemini/config/mcp_config.json" ".config/opencode/opencode.json")
+  for f in "${DIRECT_FILES[@]}"; do
+    if ! grep -q '"example-fs"' "$dhn/$f" 2>/dev/null; then
+      echo "SYNC node: direct $f missing example-fs"; fail=1
+    fi
+  done
+  if [ "$MODE" = "full" ]; then
+    dhr="$tmp/directhome_r"; make_directhome "$dhr"
+    HOME="$dhr" "$RUST_BIN" sync --catalog "$REPO" >/dev/null 2>&1
+    for f in "${DIRECT_FILES[@]}"; do
+      if ! diff -u "$dhn/$f" "$dhr/$f"; then echo "SYNC rust vs node direct drift: $f"; fail=1; fi
+    done
+  fi
+  echo "ok: sync (mcp direct)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi

@@ -13,9 +13,9 @@
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
 //!
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
-//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade route (1e-2a). Not yet
-//! ported: MCP direct projectors + secret resolver (1e-2b), hooks (1e-3), `--with-tools` /
-//! `--check-tools`.
+//! plus `sync` live projection — SKILLS symlink (1e-1) + MCP facade (1e-2a) + MCP direct
+//! claude/antigravity/opencode with the secret resolver (1e-2b). Not yet ported: codex TOML
+//! direct (1e-2c), hooks (1e-3), `--with-tools` / `--check-tools`.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -319,8 +319,346 @@ fn project_facade(servers: &[Server], home: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ---- secret resolver (port parse.js loadDotenv/resolveRef/resolveServer) — used by the
+// direct MCP route. Fixtures use only unset `env:` refs → deterministic empty values; the
+// op:// / vault: / keychain: backends shell out (never exercised by the parity gate). ----
+
+/// A resolved MCP server: registry fields with env/args/url/headers resolved for direct route.
+struct ResolvedServer {
+    name: String,
+    transport: Option<String>,
+    url: Option<String>,
+    command: Option<String>,
+    args: Vec<Json>,
+    env: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+}
+
+/// JS runCli: capture stdout (trimmed) or None on missing binary / non-zero exit.
+fn run_cli(bin: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(bin).args(args).output().ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// JS: val.replace(/\$\{(\w+)\}/g, v => env[v] ?? process.env[v] ?? (keep_unset ? "${v}" : "")).
+fn replace_braces(val: &str, env: &HashMap<String, String>, keep_unset: bool) -> String {
+    let chars: Vec<char> = val.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
+            if let Some(j) = (i + 2..chars.len()).find(|&k| chars[k] == '}') {
+                let name: String = chars[i + 2..j].iter().collect();
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    match env
+                        .get(&name)
+                        .cloned()
+                        .or_else(|| std::env::var(&name).ok())
+                    {
+                        Some(v) => out.push_str(&v),
+                        None => {
+                            if keep_unset {
+                                out.push_str("${");
+                                out.push_str(&name);
+                                out.push('}');
+                            }
+                        }
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// JS resolveRef: op:///vault:/keychain: backends; env:NAME from dotenv/process.env; else a
+/// `${VAR}` substitution. None = unresolved (caller keeps the ref / substitutes empty).
+fn resolve_ref(val: &str, env: &HashMap<String, String>) -> Option<String> {
+    if val.starts_with("op://") {
+        return run_cli("op", &["read", val]);
+    }
+    if let Some(body) = val.strip_prefix("vault:") {
+        let hash = body.rfind('#')?;
+        let (secret_path, field) = (&body[..hash], &body[hash + 1..]);
+        if secret_path.is_empty() || field.is_empty() {
+            return None;
+        }
+        return run_cli(
+            "vault",
+            &["kv", "get", &format!("-field={field}"), secret_path],
+        );
+    }
+    if let Some(body) = val.strip_prefix("keychain:") {
+        let (service, account) = match body.find('/') {
+            Some(s) => (&body[..s], Some(&body[s + 1..])),
+            None => (body, None),
+        };
+        if service.is_empty() {
+            return None;
+        }
+        let mut args = vec!["find-generic-password", "-s", service];
+        if let Some(a) = account {
+            args.push("-a");
+            args.push(a);
+        }
+        args.push("-w");
+        return run_cli("security", &args);
+    }
+    if let Some(name) = val.strip_prefix("env:").filter(|n| !n.is_empty()) {
+        return env.get(name).cloned().or_else(|| std::env::var(name).ok());
+    }
+    Some(replace_braces(val, env, false)) // else: ${VAR} → value or "" (unset)
+}
+
+/// JS loadDotenv: parse <catalog>/secrets/.env KEY=VALUE lines (skip comments). Empty if absent.
+fn load_dotenv(catalog: Option<&Path>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(c) = catalog else { return out };
+    let Ok(text) = std::fs::read_to_string(c.join("secrets").join(".env")) else {
+        return out;
+    };
+    for l in text.split('\n') {
+        if l.trim().starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = l.find('=') {
+            let key = &l[..eq];
+            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.insert(key.to_string(), l[eq + 1..].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// JS resolveServer: resolve env (unresolved → ""), args (unresolved → keep original), url
+/// (unset ${VAR} kept), and headers (env: refs resolved-or-"", literals passed through).
+fn resolve_server(s: &Server, env: &HashMap<String, String>) -> ResolvedServer {
+    let resolved_env = s
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), resolve_ref(v, env).unwrap_or_default()))
+        .collect();
+    let args = match s.args.clone().unwrap_or(Json::Arr(Vec::new())) {
+        Json::Arr(items) => items
+            .into_iter()
+            .map(|it| match &it {
+                Json::Str(a) => match resolve_ref(a, env) {
+                    Some(rv) => Json::Str(rv),
+                    None => it.clone(),
+                },
+                _ => it,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let url = s.url.as_ref().map(|u| replace_braces(u, env, true));
+    let headers = s
+        .headers
+        .iter()
+        .map(|(k, v)| {
+            if v.strip_prefix("env:").filter(|n| !n.is_empty()).is_some() {
+                (k.clone(), resolve_ref(v, env).unwrap_or_default())
+            } else {
+                (k.clone(), v.clone())
+            }
+        })
+        .collect();
+    ResolvedServer {
+        name: s.name.clone(),
+        transport: s.transport.clone(),
+        url,
+        command: s.command.clone(),
+        args,
+        env: resolved_env,
+        headers,
+    }
+}
+
+// ---- direct MCP projectors (Phase 1e-2b): claude-code / antigravity / opencode JSON RMW.
+// codex (TOML managed-block) lands in 1e-2c. Each SAFE-merges only our server keys. ----
+
+fn obj_of(pairs: &[(String, String)]) -> Json {
+    Json::Obj(
+        pairs
+            .iter()
+            .map(|(k, v)| (k.clone(), Json::Str(v.clone())))
+            .collect(),
+    )
+}
+
+/// Read a JSON config for read-modify-write: parse existing (lossless) + .bak, or a fresh {}.
+/// Returns (cfg, existed).
+fn json_read_for_rmw(file: &Path) -> Result<(Json, bool), String> {
+    if file.exists() {
+        let text =
+            std::fs::read_to_string(file).map_err(|e| format!("read {}: {e}", file.display()))?;
+        let mut bak = file.to_path_buf().into_os_string();
+        bak.push(".bak");
+        let _ = std::fs::copy(file, PathBuf::from(bak));
+        let cfg = match parse_json(&text) {
+            Ok(j @ Json::Obj(_)) => j,
+            _ => Json::Obj(Vec::new()),
+        };
+        Ok((cfg, true))
+    } else {
+        Ok((Json::Obj(Vec::new()), false))
+    }
+}
+
+fn json_write_pretty(file: &Path, cfg: &Json) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let mut out = stringify(cfg, 0);
+    out.push('\n');
+    std::fs::write(file, out).map_err(|e| format!("write {}: {e}", file.display()))
+}
+
+/// Set cfg[container][name] = entry(server) for each server (SAFE upsert, container created if
+/// missing / coerced to an object).
+fn upsert_servers(
+    cfg: &mut Json,
+    container: &str,
+    servers: &[ResolvedServer],
+    entry: impl Fn(&ResolvedServer) -> Json,
+) {
+    let top = match cfg {
+        Json::Obj(e) => e,
+        _ => return,
+    };
+    if !top.iter().any(|(k, _)| k == container) {
+        top.push((container.to_string(), Json::Obj(Vec::new())));
+    }
+    let c = top.iter_mut().find(|(k, _)| k == container).unwrap();
+    if !matches!(c.1, Json::Obj(_)) {
+        c.1 = Json::Obj(Vec::new());
+    }
+    if let Json::Obj(inner) = &mut c.1 {
+        for s in servers {
+            json_upsert(inner, &s.name, entry(s));
+        }
+    }
+}
+
+// stdio entry shared by claude-code + antigravity: {command?, args, env}.
+fn stdio_json_entry(s: &ResolvedServer) -> Vec<(String, Json)> {
+    let mut e = Vec::new();
+    if let Some(c) = &s.command {
+        e.push(("command".to_string(), Json::Str(c.clone())));
+    }
+    e.push(("args".to_string(), Json::Arr(s.args.clone())));
+    e.push(("env".to_string(), obj_of(&s.env)));
+    e
+}
+
+fn claude_entry(s: &ResolvedServer) -> Json {
+    if s.transport.as_deref() == Some("http") {
+        let mut e = vec![("type".to_string(), Json::Str("http".to_string()))];
+        if let Some(u) = &s.url {
+            e.push(("url".to_string(), Json::Str(u.clone())));
+        }
+        if !s.headers.is_empty() {
+            e.push(("headers".to_string(), obj_of(&s.headers)));
+        }
+        Json::Obj(e)
+    } else {
+        Json::Obj(stdio_json_entry(s))
+    }
+}
+
+fn antigravity_entry(s: &ResolvedServer) -> Json {
+    if s.transport.as_deref() == Some("http") {
+        let mut e = Vec::new();
+        if let Some(u) = &s.url {
+            e.push(("serverUrl".to_string(), Json::Str(u.clone())));
+        }
+        if !s.headers.is_empty() {
+            e.push(("headers".to_string(), obj_of(&s.headers)));
+        }
+        Json::Obj(e)
+    } else {
+        Json::Obj(stdio_json_entry(s))
+    }
+}
+
+fn opencode_entry(s: &ResolvedServer) -> Json {
+    let t = s.transport.as_deref();
+    if t == Some("http") || t == Some("sse") {
+        let mut e = vec![("type".to_string(), Json::Str("remote".to_string()))];
+        if let Some(u) = &s.url {
+            e.push(("url".to_string(), Json::Str(u.clone())));
+        }
+        e.push(("enabled".to_string(), Json::Bool(true)));
+        if !s.headers.is_empty() {
+            e.push(("headers".to_string(), obj_of(&s.headers)));
+        }
+        Json::Obj(e)
+    } else {
+        let mut cmd = vec![Json::Str(s.command.clone().unwrap_or_default())];
+        cmd.extend(s.args.clone());
+        let mut e = vec![
+            ("type".to_string(), Json::Str("local".to_string())),
+            ("command".to_string(), Json::Arr(cmd)),
+            ("enabled".to_string(), Json::Bool(true)),
+        ];
+        if !s.env.is_empty() {
+            e.push(("environment".to_string(), obj_of(&s.env)));
+        }
+        Json::Obj(e)
+    }
+}
+
+fn project_claude(direct: &[ResolvedServer], home: &Path) -> Result<(), String> {
+    let file = home.join(".claude.json");
+    if !(home.join(".claude").exists() || file.exists()) {
+        return Ok(()); // not installed
+    }
+    let (mut cfg, _) = json_read_for_rmw(&file)?;
+    upsert_servers(&mut cfg, "mcpServers", direct, claude_entry);
+    json_write_pretty(&file, &cfg)
+}
+
+fn project_antigravity(direct: &[ResolvedServer], home: &Path) -> Result<(), String> {
+    if !home.join(".gemini").exists() {
+        return Ok(());
+    }
+    let file = home.join(".gemini").join("config").join("mcp_config.json");
+    let (mut cfg, _) = json_read_for_rmw(&file)?;
+    upsert_servers(&mut cfg, "mcpServers", direct, antigravity_entry);
+    json_write_pretty(&file, &cfg)
+}
+
+fn project_opencode(direct: &[ResolvedServer], home: &Path) -> Result<(), String> {
+    let dir = home.join(".config").join("opencode");
+    let file = dir.join("opencode.json");
+    if !(dir.exists() || file.exists()) {
+        return Ok(());
+    }
+    let (mut cfg, existed) = json_read_for_rmw(&file)?;
+    if !existed {
+        if let Json::Obj(e) = &mut cfg {
+            e.push((
+                "$schema".to_string(),
+                Json::Str("https://opencode.ai/config.json".to_string()),
+            ));
+        }
+    }
+    upsert_servers(&mut cfg, "mcp", direct, opencode_entry);
+    json_write_pretty(&file, &cfg)
+}
+
 /// `capsync sync`: live projection into $HOME. Phase 1e covers skills symlink (1e-1) + MCP
-/// facade route (1e-2a); direct-route MCP + hooks land in later 1e sub-slices.
+/// facade route (1e-2a) + MCP direct route claude/antigravity/opencode (1e-2b); codex TOML
+/// (1e-2c) + hooks (1e-3) land later.
 /// Reads $HOME/personal/capabilities.md (like sync.js's live path, NOT --capabilities).
 fn sync_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
@@ -371,20 +709,22 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
         }
     }
 
-    // ---- MCP: facade route only (Phase 1e-2a). direct route (runtime configs) + secret
-    // resolver land in 1e-2b, so direct-route servers are noted and skipped here. ----
+    // ---- MCP: split by route. direct → resolve secrets + project into runtime configs
+    // (claude/antigravity/opencode in 1e-2b; codex TOML in 1e-2c). facade → oab-facade (1e-2a).
+    // Mirror sync.js: when any MCP is enabled, the direct projectors run (even with an empty
+    // direct list), each self-gating on whether its runtime is installed. ----
     if !enable.mcp.is_empty() {
         let registry = build_registry(catalog.as_deref(), base.as_deref());
+        let env = load_dotenv(catalog.as_deref());
+        let mut direct: Vec<ResolvedServer> = Vec::new();
         let mut facade: Vec<Server> = Vec::new();
         for want in &enable.mcp {
             match registry.get(&want.name) {
                 None => println!("  mcp {}: ERROR not in registry", want.name),
                 Some(def) => {
                     if def.route.as_deref().unwrap_or(DEFAULT_ROUTE) == "direct" {
-                        println!(
-                            "  mcp {}: route=direct (deferred to Phase 1e-2b)",
-                            want.name
-                        );
+                        direct.push(resolve_server(def, &env));
+                        println!("  mcp {}: route=direct", want.name);
                     } else {
                         facade.push(def.clone());
                         println!("  mcp {}: route=facade", want.name);
@@ -392,17 +732,14 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
                 }
             }
         }
+        // direct projectors (codex TOML deferred to 1e-2c)
+        project_claude(&direct, &home)?;
+        project_antigravity(&direct, &home)?;
+        project_opencode(&direct, &home)?;
         if !facade.is_empty() {
             project_facade(&facade, &home)?;
-            println!(
-                "[oab-facade] registered {} → ~/.openab/agent/mcp.json",
-                facade
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
         }
+        println!("[mcp] direct: {} · facade: {}", direct.len(), facade.len());
     }
     Ok(())
 }
