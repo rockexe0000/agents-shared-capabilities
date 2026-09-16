@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
-const { parseRegistry, parseHookRegistry, parseEnable, loadDotenv, resolveServer } = require('./lib/parse');
+const { parseRegistry, parseHookRegistry, parseEnable, resolveServer } = require('./lib/parse');
 const { loadBinTools, requiredToolNames, installTool, checkTool, gcTools, installDir, platformKey } = require('./lib/install-bin');
 const { buildAuthz, mapAuthz, suggestText, AUTHZ_RUNTIMES } = require('./lib/authz');
 
@@ -123,7 +123,6 @@ for (const rt of SKILL_RUNTIMES) {
 console.log(`\nenabled MCP servers: ${enable.mcp.map((s) => s.name).join(', ') || '(none)'}`);
 if (enable.mcp.length) {
   const byName = buildRegistry(PBASE);
-  const env = loadDotenv(REPO);
   const direct = [];   // resolved defs → runtime configs
   const facade = [];   // raw defs → openab mcp.json (openab resolves ${env:} itself)
   for (const want of enable.mcp) {
@@ -131,7 +130,7 @@ if (enable.mcp.length) {
     if (!def) { console.log(`  ${want.name}: ERROR not in registry`); continue; }
     const route = def.route || DEFAULT_ROUTE;
     if (route === 'direct') {
-      const { server, unresolved } = resolveServer(def, env);
+      const { server, unresolved } = resolveServer(def);
       if (unresolved.length) console.log(`  ${want.name} (direct): WARN unresolved secret(s): ${unresolved.join(', ')}`);
       direct.push(server);
     } else {

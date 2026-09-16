@@ -285,32 +285,21 @@ function parseRequires(fm) {
   return out;
 }
 
-/** load secrets/.env into a plain object (KEY=VALUE) */
-function loadDotenv(repo) {
-  const f = path.join(repo, 'secrets', '.env');
-  const out = {};
-  if (!fs.existsSync(f)) return out;
-  for (const l of fs.readFileSync(f, 'utf8').split('\n')) {
-    const m = l.match(/^([A-Za-z0-9_]+)=(.*)$/);
-    if (m && !l.trim().startsWith('#')) out[m[1]] = m[2];
-  }
-  return out;
-}
-
 /**
- * Resolve a secret reference. env: and ${VAR} resolve from dotenv/process.env;
- * op:// / vault: / keychain: go through their pluggable BACKENDS. Anything that
- * can't be resolved (missing CLI, bad ref, non-zero exit) returns {unresolved}
- * so the caller keeps the ref and warns — a raw secret is never baked in.
+ * Resolve a secret reference. env: and ${VAR} resolve from process.env (the dotenv-file
+ * fallback was retired — pods inject these via env; ADR 0008 Decision 6). op:// / vault: /
+ * keychain: go through their pluggable BACKENDS. Anything that can't be resolved (missing
+ * CLI, bad ref, non-zero exit) returns {unresolved} so the caller keeps the ref and warns —
+ * a raw secret is never baked in.
  */
-function resolveRef(val, env) {
+function resolveRef(val) {
   if (typeof val !== 'string') return val;
   if (/^op:\/\//.test(val)) return BACKENDS.op(val);
   if (/^vault:/.test(val)) return BACKENDS.vault(val);
   if (/^keychain:/.test(val)) return BACKENDS.keychain(val);
   const m = val.match(/^env:(.+)$/);
-  if (m) return env[m[1]] != null ? env[m[1]] : (process.env[m[1]] != null ? process.env[m[1]] : { unresolved: val });
-  return val.replace(/\$\{(\w+)\}/g, (_, v) => (env[v] != null ? env[v] : (process.env[v] != null ? process.env[v] : '')));
+  if (m) return process.env[m[1]] != null ? process.env[m[1]] : { unresolved: val };
+  return val.replace(/\$\{(\w+)\}/g, (_, v) => (process.env[v] != null ? process.env[v] : ''));
 }
 
 /**
@@ -319,24 +308,24 @@ function resolveRef(val, env) {
  * claude-code/antigravity) and as env-var names (out.headerEnv, for codex
  * env_http_headers which references the env var by name, keeping the secret out of file).
  */
-function resolveServer(s, env) {
+function resolveServer(s) {
   const unresolved = [];
   const out = Object.assign({}, s);
   out.env = {};
   for (const [k, v] of Object.entries(s.env || {})) {
-    const r = resolveRef(v, env);
+    const r = resolveRef(v);
     if (r && r.unresolved) { unresolved.push(`${s.name}.env.${k}=${r.unresolved}`); out.env[k] = ''; }
     else out.env[k] = r;
   }
   out.args = (s.args || []).map((a) => {
-    const r = resolveRef(a, env);
+    const r = resolveRef(a);
     return r && r.unresolved ? a : r;
   });
   if (s.url) {
     for (const [, v] of [...s.url.matchAll(/\$\{(\w+)\}/g)]) {
-      if (env[v] == null && process.env[v] == null) unresolved.push(`${s.name}.url:${v}`);
+      if (process.env[v] == null) unresolved.push(`${s.name}.url:${v}`);
     }
-    out.url = s.url.replace(/\$\{(\w+)\}/g, (_, v) => (env[v] != null ? env[v] : (process.env[v] != null ? process.env[v] : `\${${v}}`)));
+    out.url = s.url.replace(/\$\{(\w+)\}/g, (_, v) => (process.env[v] != null ? process.env[v] : `\${${v}}`));
   }
   out.headers = {};
   out.headerEnv = {};
@@ -344,7 +333,7 @@ function resolveServer(s, env) {
     const m = typeof v === 'string' && v.match(/^env:(.+)$/);
     if (m) {
       out.headerEnv[k] = m[1];
-      const r = resolveRef(v, env);
+      const r = resolveRef(v);
       if (r && r.unresolved) { unresolved.push(`${s.name}.headers.${k}=${r.unresolved}`); out.headers[k] = ''; }
       else out.headers[k] = r;
     } else {
@@ -354,4 +343,4 @@ function resolveServer(s, env) {
   return { server: out, unresolved };
 }
 
-module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, parsePermissions, frontmatterBlock, parseRequires, loadDotenv, resolveRef, resolveServer };
+module.exports = { strip, parseRegistry, parseHookRegistry, parseBinRegistry, parseEnable, parsePermissions, frontmatterBlock, parseRequires, resolveRef, resolveServer };
