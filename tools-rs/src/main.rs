@@ -1548,10 +1548,14 @@ fn apply_bin(from: &Path, home: &Path) -> Result<Vec<String>, String> {
             archive: Some(archive.to_string()),
             url: Some(url.to_string()),
             pinned_version: Some(String::new()),
+            // asset only names the temp download file (install_tool does tmp.join(asset))
+            // and substitutes ${asset} in the url — the rendered tsv url is already final, so
+            // any non-empty name works; an EMPTY one made tmp.join("") = the temp dir → curl
+            // -o <dir> fails. Use the bin name.
             platforms: vec![(
                 pk.clone(),
                 Platform {
-                    asset: Some(String::new()),
+                    asset: Some(bin.to_string()),
                     sha256: Some(sha.to_string()),
                 },
             )],

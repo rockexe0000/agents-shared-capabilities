@@ -403,7 +403,7 @@ JSON
   fi
   if [ "$MODE" = "full" ]; then
     ahr="$tmp/applyhome_r"; seed_settings "$ahr"
-    HOME="$ahr" "$RUST_BIN" apply --from "$ardir" >/dev/null 2>&1
+    HOME="$ahr" "$RUST_BIN" apply --from "$ardir" >/dev/null 2>&1 || { echo "APPLY authz: rust apply errored"; fail=1; }
     if ! diff -u "$ahn/.claude/settings.json" "$ahr/.claude/settings.json"; then
       echo "APPLY rust vs node settings.json drift"; fail=1
     fi
@@ -438,7 +438,7 @@ JSON
   grep -q '"octobroker"' "$mhn/.openab/agent/mcp.json" && grep -q '"keep-me"' "$mhn/.openab/agent/mcp.json" || { echo "APPLY node: mcp merge wrong"; fail=1; }
   if [ "$MODE" = "full" ]; then
     mhr="$tmp/mcphome_r"; seed_mcp "$mhr"
-    HOME="$mhr" "$RUST_BIN" apply --from "$mrdir" >/dev/null 2>&1
+    HOME="$mhr" "$RUST_BIN" apply --from "$mrdir" >/dev/null 2>&1 || { echo "APPLY mcp: rust apply errored"; fail=1; }
     for tf in ".openab/agent/mcp.json" ".claude.json"; do
       diff -u "$mhn/$tf" "$mhr/$tf" || { echo "APPLY mcp drift ($tf)"; fail=1; }
     done
@@ -455,7 +455,7 @@ JSON
   [ -x "$bhn/installed/demotool" ] || { echo "APPLY node: bin-apply didn't install demotool"; fail=1; }
   if [ "$MODE" = "full" ]; then
     bhr="$tmp/binhome_r"; mkdir -p "$bhr/installed"
-    HOME="$bhr" BIN_INSTALL_DIR="$bhr/installed" "$RUST_BIN" apply --from "$brdir" >/dev/null 2>&1
+    HOME="$bhr" BIN_INSTALL_DIR="$bhr/installed" "$RUST_BIN" apply --from "$brdir" >/dev/null 2>&1 || { echo "APPLY bin: rust apply errored"; fail=1; }
     diff "$bhn/installed/demotool" "$bhr/installed/demotool" || { echo "APPLY bin installed-binary drift"; fail=1; }
   fi
   echo "ok: apply (bin)"
@@ -472,7 +472,7 @@ JSON
   [ -f "$shn/skills/demo-skill/SKILL.md" ] || { echo "APPLY node: skills-apply didn't extract"; fail=1; }
   if [ "$MODE" = "full" ]; then
     shr="$tmp/skillshome_r"; mkdir -p "$shr"
-    HOME="$shr" SKILLS_DIR="$shr/skills" "$RUST_BIN" apply --from "$srdir" >/dev/null 2>&1
+    HOME="$shr" SKILLS_DIR="$shr/skills" "$RUST_BIN" apply --from "$srdir" >/dev/null 2>&1 || { echo "APPLY skills: rust apply errored"; fail=1; }
     diff -r "$shn/skills" "$shr/skills" || { echo "APPLY skills tree drift"; fail=1; }
   fi
   echo "ok: apply (skills)"
