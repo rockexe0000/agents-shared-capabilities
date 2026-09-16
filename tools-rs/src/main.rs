@@ -351,9 +351,9 @@ fn project_facade(servers: &[Server], home: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// ---- secret resolver (port parse.js loadDotenv/resolveRef/resolveServer) — used by the
-// direct MCP route. Fixtures use only unset `env:` refs → deterministic empty values; the
-// op:// / vault: / keychain: backends shell out (never exercised by the parity gate). ----
+// ---- secret resolver (port parse.js resolveRef/resolveServer) — used by the direct MCP
+// route. Fixtures use only unset `env:` refs → deterministic empty values; the op:// /
+// vault: / keychain: backends shell out (never exercised by the parity gate). ----
 
 /// A resolved MCP server: registry fields with env/args/url/headers resolved for direct route.
 struct ResolvedServer {
@@ -378,7 +378,7 @@ fn run_cli(bin: &str, args: &[&str]) -> Option<String> {
 }
 
 /// JS: val.replace(/\$\{(\w+)\}/g, v => env[v] ?? process.env[v] ?? (keep_unset ? "${v}" : "")).
-fn replace_braces(val: &str, env: &HashMap<String, String>, keep_unset: bool) -> String {
+fn replace_braces(val: &str, keep_unset: bool) -> String {
     let chars: Vec<char> = val.chars().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -387,11 +387,7 @@ fn replace_braces(val: &str, env: &HashMap<String, String>, keep_unset: bool) ->
             if let Some(j) = (i + 2..chars.len()).find(|&k| chars[k] == '}') {
                 let name: String = chars[i + 2..j].iter().collect();
                 if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    match env
-                        .get(&name)
-                        .cloned()
-                        .or_else(|| std::env::var(&name).ok())
-                    {
+                    match std::env::var(&name).ok() {
                         Some(v) => out.push_str(&v),
                         None => {
                             if keep_unset {
@@ -412,9 +408,10 @@ fn replace_braces(val: &str, env: &HashMap<String, String>, keep_unset: bool) ->
     out
 }
 
-/// JS resolveRef: op:///vault:/keychain: backends; env:NAME from dotenv/process.env; else a
-/// `${VAR}` substitution. None = unresolved (caller keeps the ref / substitutes empty).
-fn resolve_ref(val: &str, env: &HashMap<String, String>) -> Option<String> {
+/// JS resolveRef: op:///vault:/keychain: backends; env:NAME from process.env (the dotenv-file
+/// fallback was retired — ADR 0008 Decision 6); else a `${VAR}` substitution. None =
+/// unresolved (caller keeps the ref / substitutes empty).
+fn resolve_ref(val: &str) -> Option<String> {
     if val.starts_with("op://") {
         return run_cli("op", &["read", val]);
     }
@@ -446,45 +443,24 @@ fn resolve_ref(val: &str, env: &HashMap<String, String>) -> Option<String> {
         return run_cli("security", &args);
     }
     if let Some(name) = val.strip_prefix("env:").filter(|n| !n.is_empty()) {
-        return env.get(name).cloned().or_else(|| std::env::var(name).ok());
+        return std::env::var(name).ok();
     }
-    Some(replace_braces(val, env, false)) // else: ${VAR} → value or "" (unset)
-}
-
-/// JS loadDotenv: parse <catalog>/secrets/.env KEY=VALUE lines (skip comments). Empty if absent.
-fn load_dotenv(catalog: Option<&Path>) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(c) = catalog else { return out };
-    let Ok(text) = std::fs::read_to_string(c.join("secrets").join(".env")) else {
-        return out;
-    };
-    for l in text.split('\n') {
-        if l.trim().starts_with('#') {
-            continue;
-        }
-        if let Some(eq) = l.find('=') {
-            let key = &l[..eq];
-            if !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                out.insert(key.to_string(), l[eq + 1..].to_string());
-            }
-        }
-    }
-    out
+    Some(replace_braces(val, false)) // else: ${VAR} → value or "" (unset)
 }
 
 /// JS resolveServer: resolve env (unresolved → ""), args (unresolved → keep original), url
 /// (unset ${VAR} kept), and headers (env: refs resolved-or-"", literals passed through).
-fn resolve_server(s: &Server, env: &HashMap<String, String>) -> ResolvedServer {
+fn resolve_server(s: &Server) -> ResolvedServer {
     let resolved_env = s
         .env
         .iter()
-        .map(|(k, v)| (k.clone(), resolve_ref(v, env).unwrap_or_default()))
+        .map(|(k, v)| (k.clone(), resolve_ref(v).unwrap_or_default()))
         .collect();
     let args = match s.args.clone().unwrap_or(Json::Arr(Vec::new())) {
         Json::Arr(items) => items
             .into_iter()
             .map(|it| match &it {
-                Json::Str(a) => match resolve_ref(a, env) {
+                Json::Str(a) => match resolve_ref(a) {
                     Some(rv) => Json::Str(rv),
                     None => it.clone(),
                 },
@@ -493,13 +469,13 @@ fn resolve_server(s: &Server, env: &HashMap<String, String>) -> ResolvedServer {
             .collect(),
         _ => Vec::new(),
     };
-    let url = s.url.as_ref().map(|u| replace_braces(u, env, true));
+    let url = s.url.as_ref().map(|u| replace_braces(u, true));
     let mut headers = Vec::new();
     let mut header_env = Vec::new();
     for (k, v) in &s.headers {
         if let Some(name) = v.strip_prefix("env:").filter(|n| !n.is_empty()) {
             header_env.push((k.clone(), name.to_string()));
-            headers.push((k.clone(), resolve_ref(v, env).unwrap_or_default()));
+            headers.push((k.clone(), resolve_ref(v).unwrap_or_default()));
         } else {
             headers.push((k.clone(), v.clone()));
         }
@@ -1115,7 +1091,6 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
     // direct list), each self-gating on whether its runtime is installed. ----
     if !enable.mcp.is_empty() {
         let registry = build_registry(catalog.as_deref(), base.as_deref());
-        let env = load_dotenv(catalog.as_deref());
         let mut direct: Vec<ResolvedServer> = Vec::new();
         let mut facade: Vec<Server> = Vec::new();
         for want in &enable.mcp {
@@ -1123,7 +1098,7 @@ fn sync_cmd(args: &[String]) -> Result<(), String> {
                 None => println!("  mcp {}: ERROR not in registry", want.name),
                 Some(def) => {
                     if def.route.as_deref().unwrap_or(DEFAULT_ROUTE) == "direct" {
-                        direct.push(resolve_server(def, &env));
+                        direct.push(resolve_server(def));
                         println!("  mcp {}: route=direct", want.name);
                     } else {
                         facade.push(def.clone());

@@ -22,7 +22,8 @@ mcp/registry.yaml             # host-agnostic MCP server 定義(secret 只放參
 hooks/registry.yaml           # host-agnostic hook 定義(canonical event + command;ADR 0005)
 bin/registry.yaml             # host-agnostic binary/CLI 依賴定義(釘版本 + per-platform sha256;ADR 0006)
 templates/                    # SKILL / mcp-server / hook / bin-tool / capabilities 範本
-secrets/.env.example          # MCP 需要的環境變數「名稱」清單;真值放本地 secrets/.env(gitignore)
+                              # (MCP `env:`/`${VAR}` 參照從 process.env 解;pod 由 k8s 注入,
+                              #  local dev 自行 export。dotenv-file 後備已退場,ADR 0008 Decision 6)
 tools/
   sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
   lint.js                     # 驗 SKILL frontmatter、registry、capabilities 引用
