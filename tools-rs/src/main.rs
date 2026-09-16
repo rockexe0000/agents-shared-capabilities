@@ -1470,8 +1470,196 @@ fn apply_authz(from: &Path, home: &Path) -> Result<Vec<String>, String> {
     Ok(applied)
 }
 
-/// `capsync apply [--from <dir>]`: apply the render artifacts (default $HOME/.cap-render)
-/// into HOME. Current axes: authz. mcp / bin / skills land in following slices.
+/// Port of mcp-apply.js: merge a rendered {mcpServers:{...}} file's servers into a target
+/// JSON config, keeping every other key (Object.assign per-server; NO .bak, mirroring
+/// mcp-apply.js). openab-agent-mcp.json → ~/.openab/agent/mcp.json (facade sources; ${env:}
+/// refs preserved), runtime-mcp.json → ~/.claude.json (the oab-facade endpoint). Absent src
+/// or (bad target JSON) → treated as an empty base, exactly like mcp-apply.js.
+fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
+    let pairs: [(&str, PathBuf); 2] = [
+        (
+            "openab-agent-mcp.json",
+            home.join(".openab").join("agent").join("mcp.json"),
+        ),
+        ("runtime-mcp.json", home.join(".claude.json")),
+    ];
+    let mut merged = Vec::new();
+    for (src_name, target) in pairs {
+        let src = from.join(src_name);
+        let Ok(add_text) = std::fs::read_to_string(&src) else {
+            continue; // no such rendered MCP artifact
+        };
+        let add = parse_json(&add_text)
+            .map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
+        // read target (bad/missing → {}), NO .bak — mirror mcp-apply.js.
+        let mut cur = std::fs::read_to_string(&target)
+            .ok()
+            .and_then(|t| parse_json(&t).ok())
+            .filter(|j| matches!(j, Json::Obj(_)))
+            .unwrap_or_else(|| Json::Obj(Vec::new()));
+        let add_servers = match json_get(&add, "mcpServers") {
+            Some(Json::Obj(e)) => e.clone(),
+            _ => Vec::new(),
+        };
+        // cur.mcpServers = Object.assign(cur.mcpServers || {}, add.mcpServers || {})
+        if !matches!(json_get(&cur, "mcpServers"), Some(Json::Obj(_))) {
+            if let Json::Obj(top) = &mut cur {
+                json_upsert(top, "mcpServers", Json::Obj(Vec::new()));
+            }
+        }
+        if let Some(Json::Obj(dst)) = json_get_mut(&mut cur, "mcpServers") {
+            for (k, v) in add_servers {
+                json_upsert(dst, &k, v);
+            }
+        }
+        json_write_pretty(&target, &cur)?;
+        merged.push(src_name.to_string());
+    }
+    Ok(merged)
+}
+
+/// Port of bin-apply.sh via capsync's install machinery: read the rendered bin-install.tsv,
+/// install each row for this platform (fetch + verify sha256 + extract → BIN_INSTALL_DIR,
+/// lockfile-idempotent), then GC managed tools no longer listed. Reuses install_tool /
+/// install_dir / gc_tools / platform_key.
+fn apply_bin(from: &Path, home: &Path) -> Result<Vec<String>, String> {
+    let Ok(text) = std::fs::read_to_string(from.join("bin-install.tsv")) else {
+        return Ok(Vec::new());
+    };
+    let pk = platform_key();
+    let dest = install_dir(home);
+    let mut names_all: Vec<String> = Vec::new();
+    let mut acted = Vec::new();
+    for line in text.split('\n') {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 6 || f[0].is_empty() {
+            continue;
+        }
+        let (name, plat, url, sha, archive, bin) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+        if !names_all.iter().any(|n| n == name) {
+            names_all.push(name.to_string());
+        }
+        if plat != pk {
+            continue;
+        }
+        let tool = BinTool {
+            name: name.to_string(),
+            bin: Some(bin.to_string()),
+            archive: Some(archive.to_string()),
+            url: Some(url.to_string()),
+            pinned_version: Some(String::new()),
+            platforms: vec![(
+                pk.clone(),
+                Platform {
+                    asset: Some(String::new()),
+                    sha256: Some(sha.to_string()),
+                },
+            )],
+            ..Default::default()
+        };
+        let (status, _detail) = install_tool(&tool, home, &dest)?;
+        acted.push(format!("{name}:{status}"));
+    }
+    for r in gc_tools(&names_all, home) {
+        acted.push(format!("{r}:removed"));
+    }
+    Ok(acted)
+}
+
+/// RFC 4648 base64 decode (standard alphabet, '=' padding, whitespace skipped). Mirrors the
+/// `base64 -d` the pod applier uses; the render side hand-rolls the matching encode.
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut val = [255u8; 256];
+    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        .iter()
+        .enumerate()
+    {
+        val[*c as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for &b in s.as_bytes() {
+        if b == b'=' || b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val[b as usize];
+        if v == 255 {
+            return Err("base64: invalid character".to_string());
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Port of skills-apply.sh: base64-decode skills.tar.b64 and untar into the runtime skills
+/// dir, after GCing skills no longer enabled (tracked via a .catalog-managed marker) and
+/// clearing each enabled skill's dir. SKILLS_DIR env overrides the default (~/.claude/skills).
+/// Untar shells to `tar` (same as the render side), keeping byte-parity with the sh applier.
+fn apply_skills(from: &Path, home: &Path) -> Result<Vec<String>, String> {
+    let Ok(b64_text) = std::fs::read_to_string(from.join("skills.tar.b64")) else {
+        return Ok(Vec::new());
+    };
+    let dir = std::env::var("SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".claude").join("skills"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let mark = dir.join(".catalog-managed");
+    let newnames: Vec<String> = std::fs::read_to_string(from.join("skills.list"))
+        .ok()
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    // GC previously-managed skills no longer enabled.
+    if let Ok(prev) = std::fs::read_to_string(&mark) {
+        for old in prev.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
+            if !newnames.iter().any(|n| n == old) {
+                let _ = std::fs::remove_dir_all(dir.join(old));
+            }
+        }
+    }
+    // clear enabled dirs so removed files don't linger, then re-extract.
+    for nm in &newnames {
+        let _ = std::fs::remove_dir_all(dir.join(nm));
+    }
+    if !b64_text.trim().is_empty() {
+        let bytes = base64_decode(&b64_text)?;
+        let tmp = make_stage_dir().ok_or_else(|| "mktemp failed".to_string())?;
+        let tarball = tmp.join("skills.tar");
+        std::fs::write(&tarball, &bytes).map_err(|e| format!("write tar: {e}"))?;
+        let ok = std::process::Command::new("tar")
+            .arg("-xf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .map_err(|e| format!("run tar: {e}"))?
+            .success();
+        let _ = std::fs::remove_dir_all(&tmp);
+        if !ok {
+            return Err("apply: tar extract failed".to_string());
+        }
+    }
+    // record the managed set for next run's GC — verbatim copy of skills.list, or empty if
+    // absent (mirrors skills-apply.sh's `cp "$LIST" "$MARK"` / `: > "$MARK"`).
+    let marker_bytes = std::fs::read(from.join("skills.list")).unwrap_or_default();
+    std::fs::write(&mark, marker_bytes).map_err(|e| format!("write marker: {e}"))?;
+    Ok(newnames)
+}
+
+/// `capsync apply [--from <dir>]`: apply the SELF-CONTAINED render artifacts (default
+/// $HOME/.cap-render) into HOME — mcp, bin, skills, authz — replacing the pod's node/sh
+/// appliers. Each axis self-scopes (missing artifact / absent runtime → skip).
 fn apply_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
     let from = flag_value(args, "--from")
@@ -1480,15 +1668,20 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     if !from.is_dir() {
         return Err(format!("apply: render dir not found: {}", from.display()));
     }
-    let authz = apply_authz(&from, &home)?;
-    println!(
-        "apply: authz → {}",
-        if authz.is_empty() {
-            "(no runtime present)".to_string()
-        } else {
-            authz.join(", ")
-        }
-    );
+    let show = |axis: &str, v: &[String]| {
+        println!(
+            "apply: {axis} → {}",
+            if v.is_empty() {
+                "(nothing)".to_string()
+            } else {
+                v.join(", ")
+            }
+        );
+    };
+    show("mcp", &apply_mcp(&from, &home)?);
+    show("bin", &apply_bin(&from, &home)?);
+    show("skills", &apply_skills(&from, &home)?);
+    show("authz", &apply_authz(&from, &home)?);
     Ok(())
 }
 

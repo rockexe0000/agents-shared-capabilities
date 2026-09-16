@@ -409,6 +409,73 @@ JSON
     fi
   fi
   echo "ok: apply (authz)"
+
+  # ---- apply mcp parity — capsync apply vs mcp-apply.js (ADR 0008 Phase 4) ----
+  # Rendered facade + direct MCP artifacts merged into pre-existing targets (unrelated key
+  # kept + a preexisting server) — mcp-apply.js's Object.assign merge vs `capsync apply`
+  # must produce byte-identical ~/.openab/agent/mcp.json + ~/.claude.json.
+  mk_mcp_render() {
+    mkdir -p "$1"
+    printf '{\n  "mcpServers": {\n    "octobroker": {\n      "type": "http",\n      "url": "http://127.0.0.1:8079/mcp"\n    }\n  }\n}\n' > "$1/openab-agent-mcp.json"
+    printf '{\n  "mcpServers": {\n    "oab-facade": {\n      "type": "http",\n      "url": "http://127.0.0.1:8848/mcp"\n    }\n  }\n}\n' > "$1/runtime-mcp.json"
+  }
+  seed_mcp() {
+    mkdir -p "$1/.openab/agent"
+    printf '{\n  "someOtherKey": "keep-me",\n  "mcpServers": {\n    "preexisting": { "type": "stdio", "command": "foo" }\n  }\n}\n' > "$1/.openab/agent/mcp.json"
+    printf '{\n  "authState": "keep-me-too",\n  "mcpServers": {}\n}\n' > "$1/.claude.json"
+  }
+  mrdir="$tmp/mcp_render"; mk_mcp_render "$mrdir"
+  mhn="$tmp/mcphome_n"; seed_mcp "$mhn"
+  HOME="$mhn" SRC="$mrdir" node -e '
+    const fs=require("fs"),path=require("path");
+    const HOME=process.env.HOME, SRC=process.env.SRC;
+    function merge(t,s){ if(!fs.existsSync(s))return; let cur={}; try{cur=JSON.parse(fs.readFileSync(t,"utf8"))}catch(_){}
+      const add=JSON.parse(fs.readFileSync(s,"utf8")); cur.mcpServers=Object.assign(cur.mcpServers||{},add.mcpServers||{});
+      fs.mkdirSync(path.dirname(t),{recursive:true}); fs.writeFileSync(t,JSON.stringify(cur,null,2)+"\n"); }
+    merge(path.join(HOME,".openab","agent","mcp.json"), path.join(SRC,"openab-agent-mcp.json"));
+    merge(path.join(HOME,".claude.json"), path.join(SRC,"runtime-mcp.json"));
+  ' >/dev/null 2>&1
+  grep -q '"octobroker"' "$mhn/.openab/agent/mcp.json" && grep -q '"keep-me"' "$mhn/.openab/agent/mcp.json" || { echo "APPLY node: mcp merge wrong"; fail=1; }
+  if [ "$MODE" = "full" ]; then
+    mhr="$tmp/mcphome_r"; seed_mcp "$mhr"
+    HOME="$mhr" "$RUST_BIN" apply --from "$mrdir" >/dev/null 2>&1
+    for tf in ".openab/agent/mcp.json" ".claude.json"; do
+      diff -u "$mhn/$tf" "$mhr/$tf" || { echo "APPLY mcp drift ($tf)"; fail=1; }
+    done
+  fi
+  echo "ok: apply (mcp)"
+
+  # ---- apply bin parity — capsync apply vs bin-apply.sh (ADR 0008 Phase 4) ----
+  # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
+  # bin-apply.sh vs `capsync apply` must install the identical binary into BIN_INSTALL_DIR.
+  brdir="$tmp/bin_render"; mkdir -p "$brdir"
+  printf 'demotool\t%s\tfile://%s\t%s\ttar.gz\tdemotool\n' "$pk" "$fake/demotool-$pk.tar.gz" "$asset_sha" > "$brdir/bin-install.tsv"
+  bhn="$tmp/binhome_n"; mkdir -p "$bhn/installed"
+  HOME="$bhn" MCP_ARTIFACT_DIR="$brdir" BIN_INSTALL_DIR="$bhn/installed" sh "$REPO/templates/pod-apply/bin-apply.sh" >/dev/null 2>&1
+  [ -x "$bhn/installed/demotool" ] || { echo "APPLY node: bin-apply didn't install demotool"; fail=1; }
+  if [ "$MODE" = "full" ]; then
+    bhr="$tmp/binhome_r"; mkdir -p "$bhr/installed"
+    HOME="$bhr" BIN_INSTALL_DIR="$bhr/installed" "$RUST_BIN" apply --from "$brdir" >/dev/null 2>&1
+    diff "$bhn/installed/demotool" "$bhr/installed/demotool" || { echo "APPLY bin installed-binary drift"; fail=1; }
+  fi
+  echo "ok: apply (bin)"
+
+  # ---- apply skills parity — capsync apply vs skills-apply.sh (ADR 0008 Phase 4) ----
+  # Rendered skills.tar.b64 + skills.list → both extract the identical skills tree (incl. the
+  # .catalog-managed marker) into SKILLS_DIR.
+  srdir="$tmp/skills_render"; mkdir -p "$srdir/stage/demo-skill"
+  printf 'hello\n' > "$srdir/stage/demo-skill/SKILL.md"
+  ( cd "$srdir/stage" && tar -cf - demo-skill | base64 > "$srdir/skills.tar.b64" )
+  printf 'demo-skill\n' > "$srdir/skills.list"
+  shn="$tmp/skillshome_n"; mkdir -p "$shn"
+  HOME="$shn" MCP_ARTIFACT_DIR="$srdir" SKILLS_DIR="$shn/skills" sh "$REPO/templates/pod-apply/skills-apply.sh" >/dev/null 2>&1
+  [ -f "$shn/skills/demo-skill/SKILL.md" ] || { echo "APPLY node: skills-apply didn't extract"; fail=1; }
+  if [ "$MODE" = "full" ]; then
+    shr="$tmp/skillshome_r"; mkdir -p "$shr"
+    HOME="$shr" SKILLS_DIR="$shr/skills" "$RUST_BIN" apply --from "$srdir" >/dev/null 2>&1
+    diff -r "$shn/skills" "$shr/skills" || { echo "APPLY skills tree drift"; fail=1; }
+  fi
+  echo "ok: apply (skills)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi
