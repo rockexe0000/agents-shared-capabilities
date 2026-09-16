@@ -1672,21 +1672,35 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
     if !from.is_dir() {
         return Err(format!("apply: render dir not found: {}", from.display()));
     }
-    let show = |axis: &str, v: &[String]| {
-        println!(
+    // Run each axis INDEPENDENTLY so one axis's failure never skips another — in particular
+    // authz (the security axis) must not be skipped by a bin network hiccup. authz runs first
+    // (local, security), then mcp/skills (local), then bin (network) last. Errors are logged
+    // and collected; a non-empty failure set makes `apply` exit non-zero (pre_boot logs it
+    // non-fatal), but every axis was attempted.
+    let mut failed: Vec<&str> = Vec::new();
+    let mut run = |axis: &'static str, res: Result<Vec<String>, String>| match res {
+        Ok(v) => println!(
             "apply: {axis} → {}",
             if v.is_empty() {
                 "(nothing)".to_string()
             } else {
                 v.join(", ")
             }
-        );
+        ),
+        Err(e) => {
+            eprintln!("apply: {axis} FAILED — {e}");
+            failed.push(axis);
+        }
     };
-    show("mcp", &apply_mcp(&from, &home)?);
-    show("bin", &apply_bin(&from, &home)?);
-    show("skills", &apply_skills(&from, &home)?);
-    show("authz", &apply_authz(&from, &home)?);
-    Ok(())
+    run("authz", apply_authz(&from, &home));
+    run("mcp", apply_mcp(&from, &home));
+    run("skills", apply_skills(&from, &home));
+    run("bin", apply_bin(&from, &home));
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("apply: axis(es) failed: {}", failed.join(", ")))
+    }
 }
 
 // ----------------------------------------------------------------------------
