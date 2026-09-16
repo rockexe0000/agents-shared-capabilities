@@ -368,6 +368,47 @@ REG
     [ "$r_bad" -eq "$n_bad" ] || { echo "LINT rust broken exit $r_bad != node $n_bad"; fail=1; }
   fi
   echo "ok: lint (valid + broken)"
+
+  # ---- apply authz parity — capsync apply vs perms-apply.sh (ADR 0008 Phase 4) ----
+  # From the same rendered authz-claude-code.json, merging into a seeded settings.json
+  # (unrelated key kept + a pre-existing allow REPLACED + a pre-existing deny UNIONed),
+  # perms-apply.sh and `capsync apply` must produce a byte-identical ~/.claude/settings.json.
+  mk_authz_render() {
+    mkdir -p "$1"
+    printf '{\n  "allow": [\n    "Bash(cfdrop:*)"\n  ],\n  "deny": [\n    "Bash(rm:*)"\n  ]\n}\n' \
+      > "$1/authz-claude-code.json"
+  }
+  seed_settings() {
+    mkdir -p "$1/.claude"
+    cat > "$1/.claude/settings.json" <<'JSON'
+{
+  "model": "keep-me",
+  "permissions": {
+    "allow": [
+      "Bash(old:*)"
+    ],
+    "deny": [
+      "Bash(danger:*)"
+    ]
+  }
+}
+JSON
+  }
+  ardir="$tmp/apply_render"; mk_authz_render "$ardir"
+  ahn="$tmp/applyhome_n"; seed_settings "$ahn"
+  AUTHZ_FILE="$ardir/authz-claude-code.json" SETTINGS_FILE="$ahn/.claude/settings.json" \
+    HOME="$ahn" sh "$REPO/templates/pod-apply/perms-apply.sh" >/dev/null 2>&1
+  if ! grep -q '"keep-me"' "$ahn/.claude/settings.json" || ! grep -q '"Bash(cfdrop:\*)"' "$ahn/.claude/settings.json"; then
+    echo "APPLY node: perms-apply didn't merge as expected:"; cat "$ahn/.claude/settings.json"; fail=1
+  fi
+  if [ "$MODE" = "full" ]; then
+    ahr="$tmp/applyhome_r"; seed_settings "$ahr"
+    HOME="$ahr" "$RUST_BIN" apply --from "$ardir" >/dev/null 2>&1
+    if ! diff -u "$ahn/.claude/settings.json" "$ahr/.claude/settings.json"; then
+      echo "APPLY rust vs node settings.json drift"; fail=1
+    fi
+  fi
+  echo "ok: apply (authz)"
 fi
 
 if [ "$MODE" = "update-golden" ]; then echo "golden regenerated."; exit 0; fi

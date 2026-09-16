@@ -93,8 +93,17 @@ fn main() -> ExitCode {
             }
         };
     }
+    if args.first().map(|a| a == "apply").unwrap_or(false) {
+        return match apply_cmd(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("{msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     eprintln!(
-        "usage: capsync sync | lint | --render <outdir> | --check <dir> | --check-tools  [--capabilities <file>] [--catalog <dir>]"
+        "usage: capsync sync | apply [--from <dir>] | lint | --render <outdir> | --check <dir> | --check-tools  [--capabilities <file>] [--catalog <dir>]"
     );
     ExitCode::FAILURE
 }
@@ -904,6 +913,19 @@ fn json_get_mut<'a>(obj: &'a mut Json, key: &str) -> Option<&'a mut Json> {
         _ => None,
     }
 }
+/// String items of obj[key] when it is an array of strings; empty otherwise.
+fn json_str_array(obj: &Json, key: &str) -> Vec<String> {
+    match json_get(obj, key) {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(|it| match it {
+                Json::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 // one hook entry's group: { [matcher?], hooks: [entry] }.
 fn hook_group(matcher: &Option<String>, entry: Json) -> Json {
@@ -1369,6 +1391,105 @@ fn strip_comment(s: &str) -> String {
 /// JS: raw.replace(/\s+$/, ''). Trims trailing ASCII/Unicode whitespace.
 fn trim_end(s: &str) -> &str {
     s.trim_end_matches(|c: char| c.is_whitespace())
+}
+
+// ----------------------------------------------------------------------------
+// `capsync apply` (ADR 0008 Phase 4) — apply the SELF-CONTAINED render artifacts in
+// $HOME/.cap-render into HOME, replacing the pod's POSIX-sh / node appliers with one
+// Rust binary. Unlike `sync`, apply reads the RENDER OUTPUT (authz-*.json / *-mcp.json /
+// bin-install.tsv / skills.tar.b64), NOT the catalog — so it needs no catalog checkout
+// and keeps the ephemeral-init supply-chain boundary (ADR 0008 Decision 3). Axes land
+// one slice at a time (this slice: authz; mcp / bin / skills follow), each gated by a
+// parity test vs the script it replaces. Each axis self-scopes to the runtimes present
+// on the pod (gates on the runtime's base dir existing), like sync.
+// ----------------------------------------------------------------------------
+
+/// authz apply targets: (render runtime id, runtime base dir, settings.json path) — all
+/// relative to $HOME. Mirrors AUTHZ_RUNTIMES + the per-agent SETTINGS_FILE paths that
+/// perms-apply.sh is driven with (claude-code → ~/.claude, antigravity → the agy CLI dir).
+const AUTHZ_APPLY: &[(&str, &[&str], &[&str])] = &[
+    ("claude-code", &[".claude"], &[".claude", "settings.json"]),
+    (
+        "antigravity",
+        &[".gemini", "antigravity-cli"],
+        &[".gemini", "antigravity-cli", "settings.json"],
+    ),
+];
+
+/// Port of perms-apply.sh: MERGE authz-<runtime>.json ({allow,deny}) into the runtime's
+/// settings.json — permissions.allow is REPLACED (projection owns the allowlist, GC-correct)
+/// and permissions.deny is the UNION of existing ∪ managed, sorted+unique (deny never
+/// auto-drops). Every other setting is preserved (RMW + .bak). Runtimes whose base dir is
+/// absent, or with no authz artifact in `from`, are skipped.
+fn apply_authz(from: &Path, home: &Path) -> Result<Vec<String>, String> {
+    let mut applied = Vec::new();
+    for (id, base_rel, settings_rel) in AUTHZ_APPLY {
+        if !join_all(home, base_rel).exists() {
+            continue; // runtime not present on this pod
+        }
+        let authz_file = from.join(format!("authz-{id}.json"));
+        let Ok(text) = std::fs::read_to_string(&authz_file) else {
+            continue; // no authz artifact for this runtime in the render dir
+        };
+        let managed = parse_json(&text)
+            .map_err(|_| format!("apply: invalid JSON in {}", authz_file.display()))?;
+        let allow = json_str_array(&managed, "allow");
+        let managed_deny = json_str_array(&managed, "deny");
+
+        let settings = join_all(home, settings_rel);
+        let (mut cfg, _) = json_read_for_rmw(&settings)?; // writes .bak; returns Obj
+
+        // deny = sorted(unique(existing ∪ managed)) — matches perms-apply's set-union.
+        let mut deny = json_get(&cfg, "permissions")
+            .map(|p| json_str_array(p, "deny"))
+            .unwrap_or_default();
+        deny.extend(managed_deny);
+        deny.sort();
+        deny.dedup();
+
+        if !matches!(json_get(&cfg, "permissions"), Some(Json::Obj(_))) {
+            if let Json::Obj(top) = &mut cfg {
+                json_upsert(top, "permissions", Json::Obj(Vec::new()));
+            }
+        }
+        if let Some(Json::Obj(perms)) = json_get_mut(&mut cfg, "permissions") {
+            json_upsert(
+                perms,
+                "allow",
+                Json::Arr(allow.into_iter().map(Json::Str).collect()),
+            );
+            json_upsert(
+                perms,
+                "deny",
+                Json::Arr(deny.into_iter().map(Json::Str).collect()),
+            );
+        }
+        json_write_pretty(&settings, &cfg)?;
+        applied.push((*id).to_string());
+    }
+    Ok(applied)
+}
+
+/// `capsync apply [--from <dir>]`: apply the render artifacts (default $HOME/.cap-render)
+/// into HOME. Current axes: authz. mcp / bin / skills land in following slices.
+fn apply_cmd(args: &[String]) -> Result<(), String> {
+    let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
+    let from = flag_value(args, "--from")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cap-render"));
+    if !from.is_dir() {
+        return Err(format!("apply: render dir not found: {}", from.display()));
+    }
+    let authz = apply_authz(&from, &home)?;
+    println!(
+        "apply: authz → {}",
+        if authz.is_empty() {
+            "(no runtime present)".to_string()
+        } else {
+            authz.join(", ")
+        }
+    );
+    Ok(())
 }
 
 // ----------------------------------------------------------------------------
