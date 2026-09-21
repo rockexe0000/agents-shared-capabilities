@@ -1,14 +1,15 @@
 name: tools-rs-parity
 
-# ADR 0008 Phase 0/1 gate: the Rust `capsync` port must stay byte-for-byte identical to
-# `tools/sync.js --render` (authz axis for the spike; more axes as Phase 1 lands). Runs on
-# ubuntu-latest, which ships a C toolchain (the linker the Rust build needs).
+# ADR 0008 regression gate: `capsync` must keep rendering/checking/syncing/applying the catalog
+# exactly as the committed golden expects. (The node `tools/` reference backend was retired once
+# per-axis byte parity held, so the gate is now rust vs committed golden.) Runs on ubuntu-latest,
+# which ships a C toolchain (the linker the Rust build needs).
 on:
   push:
     branches: [main]
-    paths: ['tools-rs/**', 'tools/**']
+    paths: ['tools-rs/**']
   pull_request:
-    paths: ['tools-rs/**', 'tools/**']
+    paths: ['tools-rs/**']
 
 jobs:
   parity:
@@ -18,9 +19,6 @@ jobs:
         working-directory: tools-rs
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
       # Pinned to match rust-toolchain.toml (ADR 0008 Decision 2 — reproducible build).
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -32,5 +30,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit tests
         run: cargo test
-      - name: Byte-for-byte parity vs node (rust + node vs committed golden)
+      - name: Regression gate (rust vs committed golden)
         run: ./parity.sh
