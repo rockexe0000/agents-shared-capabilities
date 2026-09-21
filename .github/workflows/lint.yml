@@ -10,11 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Pinned to match rust-toolchain.toml (ADR 0008 Decision 2 — reproducible build).
+      - uses: dtolnay/rust-toolchain@master
         with:
-          node-version: '20'
-      # Catalog tooling is dependency-free — no install step needed.
+          toolchain: "1.98.1"
+      - name: Build capsync
+        working-directory: tools-rs
+        run: cargo build --release --quiet
       - name: Lint capability catalog
-        run: node tools/lint.js
-      - name: Sync smoke (dry-run, empty HOME)
-        run: HOME="$(mktemp -d)" node tools/sync.js --dry-run
+        run: tools-rs/target/release/capsync lint --catalog .

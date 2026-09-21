@@ -1,6 +1,6 @@
 # host-agnostic hook registry(集體 catalog)—— capability 第三軸(ADR 0005)
 # 只放「定義」;secret 走參照,不進 repo。個人專屬 hook 放 agent-bot/{uid}/hooks/。
-# schema/範本:templates/hook.template.yaml;投影器:tools/projectors/。
+# schema/範本:templates/hook.template.yaml;投影器:tools-rs/(capsync)。
 #
 # 授權(ADR 0005 D3):hook 由 harness 自動執行、繞過 Permission Boundary,故無 ask,
 #   只有 allow/deny —— 授權前移到「是否 enable」這一步,寫在 ~/personal/capabilities.md

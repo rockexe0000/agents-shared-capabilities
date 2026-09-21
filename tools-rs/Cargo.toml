@@ -2,7 +2,7 @@
 name = "capsync"
 version = "0.0.0"
 edition = "2021"
-description = "ADR 0008: single-file, runtime-portable capability tooling (render/check/sync/check-tools) at byte-for-byte parity with tools/sync.js."
+description = "ADR 0008: single-file, runtime-portable capability tooling (render/check/sync/apply/check-tools/lint) — the sole projection backend after the node tools/ + sh applier retirement."
 publish = false
 
 [[bin]]

@@ -239,9 +239,9 @@ fn check(args: &[String]) -> Result<bool, String> {
 
 // ----------------------------------------------------------------------------
 // live `sync` projection (ADR 0008 Phase 1e) — mutates $HOME to project the enabled subset
-// into installed runtimes. Phase 1e-1 covers the SKILLS axis only (symlink each enabled skill
-// into each runtime's skills dir); MCP merge + hooks land in later 1e sub-slices, so this is
-// a PARTIAL sync that runs parallel to node's sync.js (never the sole projector yet).
+// into installed runtimes across all axes: SKILLS (symlink each enabled skill into each
+// runtime's skills dir), MCP merge, and hooks. This is the sole live projector — the node
+// sync.js backend it was ported from has been retired.
 // ----------------------------------------------------------------------------
 
 // (id, runtime base dir, skills dir) relative to $HOME. base must exist for the runtime to be

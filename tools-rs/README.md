@@ -1,17 +1,17 @@
 # tools-rs — capability tooling, Rust port (ADR 0008)
 
-`capsync`: a single-file, runtime-portable reimplementation of `tools/` (the capability
-projection tooling). ADR 0008 unifies the node + POSIX-sh backends into one static binary.
-During migration `tools-rs/` runs **parallel** to `tools/` — node/sh stays canonical until
-per-axis byte-for-byte parity is proven, then node is removed (Phase 4).
+`capsync`: a single-file, runtime-portable reimplementation of the capability projection
+tooling. ADR 0008 unified the former node + POSIX-sh backends into this one static binary.
+The migration is complete: `capsync` is now the sole implementation — the node `tools/`
+reference backend and the sh pod-appliers were retired once per-axis byte parity held.
 
 Decision WHY / trade-offs: `agents-cold-memory:shared/adr/0008-tooling-rust-unification`.
 Work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooling-rust-unification`).
 
 ## Scope (current)
 
-`capsync` mirrors `tools/sync.js` at byte-for-byte parity, all JSON emitted as
-`JSON.stringify(x, null, 2) + "\n"` via a hand-rolled serializer:
+All JSON is emitted as `JSON.stringify(x, null, 2) + "\n"` (the shape the retired node backend
+produced, frozen into the committed golden) via a hand-rolled serializer:
 
 | command | what it does |
 |---------|--------------|
@@ -21,9 +21,9 @@ Work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooli
 | `--check-tools …` | verify installed bin tools vs the registry (drift → exit 1); no network |
 | `lint [--catalog <d>]` | validate the catalog (bin/skills/mcp/hooks registries: naming, uniqueness, secret hygiene, supply-chain pins, `requires` floors); errors → exit 1 |
 
-`--catalog <dir>` points at a local checkout of this catalog repo (`sync.js` infers it from
-`__dirname`; a standalone binary can't, so it's an explicit flag — falls back to an exe-relative
-guess). Ports `tools/lib/{parse,authz,install-bin}.js`, `tools/sync.js`, `tools/projectors/*`.
+`--catalog <dir>` points at a local checkout of this catalog repo. A standalone binary can't
+infer it from its own path reliably, so it's an explicit flag — falling back to an exe-relative
+guess (`<root>/tools-rs/target/<profile>/capsync` → repo root).
 
 ## Build / test / parity
 
@@ -31,20 +31,19 @@ guess). Ports `tools/lib/{parse,authz,install-bin}.js`, `tools/sync.js`, `tools/
 cd tools-rs
 cargo test                    # unit tests (parsers / json / sha256 / base64 / shapes)
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
-./parity.sh                   # build rust + run node, diff both vs committed golden
-./parity.sh --node-only       # skip the rust half (env without a C linker)
-./parity.sh --update-golden   # regenerate golden from node (maintenance)
+./parity.sh                   # build rust + diff render vs committed golden + stateful asserts
+./parity.sh --update-golden   # regenerate golden from capsync (maintenance)
 ```
 
-The gate renders every fixture under `tests/fixtures/<case>/` three ways — node, rust, and the
-committed `tests/golden/<case>/` — and fails on any diff, so a regression in **either** side is
-caught. It also exercises the stateful paths in isolated `$HOME`s (live `sync` skills/MCP/hooks,
-`--check`, `--check-tools`, `--with-tools` via a `file://` fake asset) comparing node vs rust.
-CI runs the full gate on `ubuntu-latest` (`.github/workflows/tools-rs-parity.yml`).
+The gate renders every fixture under `tests/fixtures/<case>/` with `capsync` and diffs it against
+the committed `tests/golden/<case>/`, so any render regression is caught. It also exercises the
+stateful paths in isolated `$HOME`s (live `sync` skills/MCP/hooks, `--check`, `--check-tools`,
+`--with-tools` via a `file://` fake asset, and `apply` of each axis) and asserts capsync's
+behaviour directly. CI runs the full gate on `ubuntu-latest` (`.github/workflows/tools-rs-parity.yml`).
 
-> A linker-less environment (no `cc`/`gcc`) can still run `cargo check`, `fmt`, `clippy`, and
-> `./parity.sh --node-only`, but not `cargo test`/`build`/full parity (all require linking). The
-> executing rust-vs-node byte comparison runs in CI.
+> A linker-less environment (no `cc`/`gcc`) can still run `cargo check`, `fmt`, and `clippy`, but
+> not `cargo test`/`build` or `./parity.sh` (all require linking) — the executing byte comparison
+> runs in CI.
 
 ## Supply chain (ADR 0008 Decision 2 / ADR 0006 template)
 

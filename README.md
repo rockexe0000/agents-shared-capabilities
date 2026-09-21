@@ -24,14 +24,11 @@ bin/registry.yaml             # host-agnostic binary/CLI 依賴定義(釘版本 
 templates/                    # SKILL / mcp-server / hook / bin-tool / capabilities 範本
                               # (MCP `env:`/`${VAR}` 參照從 process.env 解;pod 由 k8s 注入,
                               #  local dev 自行 export。dotenv-file 後備已退場,ADR 0008 Decision 6)
-tools/
-  sync.sh / sync.js           # 讀 catalog + capabilities.md,投影進各 runtime
-  lint.js                     # 驗 SKILL frontmatter、registry、capabilities 引用
-  projectors/                 # 投影器
-    claude-code.js            # direct:~/.claude/skills、~/.claude.json mcpServers、~/.claude/settings.json hooks
-    codex.js                  # direct:~/.codex/skills、~/.codex/config.toml [mcp_servers]
-    antigravity.js            # direct:~/.gemini/antigravity-cli/skills、~/.gemini/config/mcp_config.json
-    oab-facade.js             # facade:~/.openab/agent/mcp.json(facade 背後的 source)
+tools-rs/                     # capsync:單一 static Rust binary,承載全部能力投影工具
+  src/main.rs                 #   render / --check / sync / apply / --check-tools / lint
+                              #   投影目標:claude-code / codex / antigravity(direct:skills +
+                              #   MCP config + hooks)、oab-facade(facade:~/.openab/agent/mcp.json)
+                              #   (ADR 0008:node tools/ + sh pod-applier 已退役,capsync 為唯一實作)
 ```
 
 ## MCP route(預設 facade)
@@ -45,8 +42,8 @@ registry 每個 server 標 `route`(預設 `facade`):
 
 skill 會 shell out 的 native binary/CLI 在 `bin/registry.yaml` 宣告一次(`name` / `source` / `pinned-version` / 每個 `(os-arch)` 的 `asset`+`sha256`〔+選用 `provenance`〕);skill 於 `SKILL.md` frontmatter 用 `requires: [{name, min}]` 引用,`min` 是版本地板。
 
-- **供應鏈**:外部來源一律 pinned-version + per-platform sha256(`lint.js` 強制);`provenance: none|attestation|cosign`(有就驗、`none` 為顯性降級)。安裝/執行外部 binary 過 permissions 的 `ask` 閘。
-- **安裝(dev,已實作)**:`node tools/sync.js --with-tools`(opt-in)算 enabled skills 的 required-bins 閉包 → 抓釘版 asset → 驗 sha256 → 落受管 bin dir(`~/.agents-shared-capabilities/state/bin`)並提示掛 PATH;冪等(已裝且 checksum 相符則 skip),不再 required 的自動 GC。`node tools/sync.js --check-tools [--capabilities <f>]` 驗安裝漂移(present/版本/checksum,漂移 exit 1,供 CI/cron)。
+- **供應鏈**:外部來源一律 pinned-version + per-platform sha256(`capsync lint` 強制);`provenance: none|attestation|cosign`(有就驗、`none` 為顯性降級)。安裝/執行外部 binary 過 permissions 的 `ask` 閘。
+- **安裝(dev,已實作)**:`capsync sync --with-tools`(opt-in)算 enabled skills 的 required-bins 閉包 → 抓釘版 asset → 驗 sha256 → 落受管 bin dir(`~/.agents-shared-capabilities/state/bin`)並提示掛 PATH;冪等(已裝且 checksum 相符則 skip),不再 required 的自動 GC。`capsync --check-tools [--capabilities <f>]` 驗安裝漂移(present/版本/checksum,漂移 exit 1,供 CI/cron)。
 - **安裝(pod,規劃中)**:agents-infra build-time 讀同一 manifest 烤進 image。實作進度見 handoff `agents-cold-memory:shared/handoffs/discord-1546431897800933426-binary-dependency-provisioning`。
 - **lint**:`requires` 必須 resolve 到 `bin/registry.yaml`,且釘版 ≥ 各 requiring skill 的 `min`。
 
@@ -56,15 +53,19 @@ skill 會 shell out 的 native binary/CLI 在 `bin/registry.yaml` 宣告一次(`
 # 1. clone 到固定位置
 git clone https://github.com/rockexe0000/agents-shared-capabilities ~/.agents-shared-capabilities
 
-# 2. 從範本生 per-agent 選擇清單(本地,cold 版控於 agent-bot/{uid}/personal)
+# 2. build capsync(或抓 pinned release asset,見 tools-rs/README.md)
+( cd ~/.agents-shared-capabilities/tools-rs && cargo build --release )
+capsync=~/.agents-shared-capabilities/tools-rs/target/release/capsync
+
+# 3. 從範本生 per-agent 選擇清單(本地,cold 版控於 agent-bot/{uid}/personal)
 cp ~/.agents-shared-capabilities/templates/capabilities.template.md ~/personal/capabilities.md
 # 編輯 ~/personal/capabilities.md:列出要啟用的 skill 與 MCP server(預設全關)
 
-# 3. 投影進本機已安裝的每個 runtime
-node ~/.agents-shared-capabilities/tools/sync.js        # 或 tools/sync.sh
+# 4. 投影進本機已安裝的每個 runtime(capsync 由 exe 相對路徑推得 catalog)
+"$capsync" sync
 
-# 4. lint(CI 也會跑)
-node ~/.agents-shared-capabilities/tools/lint.js
+# 5. lint(CI 也會跑)
+"$capsync" lint
 ```
 
 Codex 需重啟才吃到新 skill;Claude Code 下次啟動載入。
@@ -79,7 +80,7 @@ Codex 需重啟才吃到新 skill;Claude Code 下次啟動載入。
 option-C(render → configMap)下,pod 上沒有 repo checkout,漂移風險是**已 commit 的 render 產物** vs **catalog + 該 agent `capabilities.md`** 走鐘。`--check` 是確定性比對:重跑 render 與指定目錄的已 commit 產物比較,漂移則 exit 1(供 CI 或維運 cron fail loud)。
 
 ```sh
-node tools/sync.js --check <committed-artifacts-dir> --capabilities <capabilities.md>
+capsync --check <committed-artifacts-dir> --capabilities <capabilities.md> --catalog <repo>
 ```
 
 例:CI 於 agents-infra checkout 本 repo + cold repo,對每個 agent overlay 跑 `--check overlays/<agent> --capabilities <cold>/agent-bot/<agent>/personal/capabilities.md`。
