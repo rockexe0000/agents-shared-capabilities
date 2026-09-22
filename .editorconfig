@@ -1,0 +1,26 @@
+# EditorConfig — 跨編輯器統一縮排/編碼(https://editorconfig.org)
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Rust(tools-rs)慣例 4 空格,交給 rustfmt
+[*.rs]
+indent_size = 4
+
+# Markdown 行尾雙空格是硬換行語法,不可裁掉
+[*.md]
+trim_trailing_whitespace = false
+
+# Shell 腳本
+[*.sh]
+indent_size = 2
+
+# Makefile 若日後出現須用 tab
+[Makefile]
+indent_style = tab
