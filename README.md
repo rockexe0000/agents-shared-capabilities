@@ -101,3 +101,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ## 貢獻
 
 所有 catalog 變更走 PR,**merge = review 閘**;接入外部能力一律 vendored + 釘版本 + checksum。流程、本地開發指令與供應鏈規矩見 [CONTRIBUTING.md](CONTRIBUTING.md)。漏洞回報見 [SECURITY.md](SECURITY.md)。
+
+## 授權
+
+本專案採 [MIT](LICENSE) 授權。
