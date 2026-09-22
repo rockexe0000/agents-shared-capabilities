@@ -84,3 +84,20 @@ capsync --check <committed-artifacts-dir> --capabilities <capabilities.md> --cat
 ```
 
 例:CI 於 agents-infra checkout 本 repo + cold repo,對每個 agent overlay 跑 `--check overlays/<agent> --capabilities <cold>/agent-bot/<agent>/personal/capabilities.md`。
+
+## 開發
+
+全部工具是 `tools-rs/` 的單一 Rust binary `capsync`(**零外部 crate**,無 node、無 npm;ADR 0008 已讓 node `tools/` + sh applier 退役)。
+
+```sh
+cd tools-rs
+cargo test                  # 單元測試(parser / json / sha256 / base64 / shape)
+cargo fmt --check && cargo clippy --all-targets -- -D warnings
+./parity.sh                 # build capsync + render vs committed golden 逐 byte 比對 + stateful 斷言
+```
+
+無 C linker 的環境仍可跑 `cargo check` / `fmt` / `clippy`,但 `cargo test` / `build` / `./parity.sh` 需連結——執行期比對在 CI 跑。CI:`lint`(build capsync + `capsync lint --catalog .`)與 `tools-rs-parity`(fmt / clippy / test / `parity.sh`)。細節見 [`tools-rs/README.md`](tools-rs/README.md)。
+
+## 貢獻
+
+所有 catalog 變更走 PR,**merge = review 閘**;接入外部能力一律 vendored + 釘版本 + checksum。流程、本地開發指令與供應鏈規矩見 [CONTRIBUTING.md](CONTRIBUTING.md)。漏洞回報見 [SECURITY.md](SECURITY.md)。
