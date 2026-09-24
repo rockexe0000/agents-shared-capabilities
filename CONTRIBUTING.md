@@ -1,6 +1,6 @@
 # 貢獻指南(Contributing)
 
-先讀 [README](README.md) 了解這個 catalog 的角色與 layout,再動手。設計與 WHY(ADR)集中在 [`docs/design-notes.md`](docs/design-notes.md)。
+先讀 [README](README.md) 了解這個 catalog 的角色與 layout,再動手。設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。
 
 ## 核心原則
 
