@@ -2,7 +2,7 @@
 
 跨 Coding Agent 的**能力供給正本**:Agent Skills 與 MCP(Model Context Protocol)servers 的單一 catalog,投影進各 runtime(Claude Code、Codex、Antigravity、opencode…)。
 
-> 設計與 WHY:ADR `agents-cold-memory:shared/adr/0002-agent-capability-provisioning`。
+> 設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。
 > 本 repo 只承載**集體 catalog**;個人專屬能力放該 agent 的 cold 命名空間 `agent-bot/{uid}/{skills,mcp}/`。
 
 ## 兩道閘
@@ -44,7 +44,7 @@ skill 會 shell out 的 native binary/CLI 在 `bin/registry.yaml` 宣告一次(`
 
 - **供應鏈**:外部來源一律 pinned-version + per-platform sha256(`capsync lint` 強制);`provenance: none|attestation|cosign`(有就驗、`none` 為顯性降級)。安裝/執行外部 binary 過 permissions 的 `ask` 閘。
 - **安裝(dev,已實作)**:`capsync sync --with-tools`(opt-in)算 enabled skills 的 required-bins 閉包 → 抓釘版 asset → 驗 sha256 → 落受管 bin dir(`~/.agents-shared-capabilities/state/bin`)並提示掛 PATH;冪等(已裝且 checksum 相符則 skip),不再 required 的自動 GC。`capsync --check-tools [--capabilities <f>]` 驗安裝漂移(present/版本/checksum,漂移 exit 1,供 CI/cron)。
-- **安裝(pod,規劃中)**:agents-infra build-time 讀同一 manifest 烤進 image。實作進度見 handoff `agents-cold-memory:shared/handoffs/discord-1546431897800933426-binary-dependency-provisioning`。
+- **安裝(pod,規劃中)**:agents-infra build-time 讀同一 manifest 烤進 image(設計見 [ADR 0006](docs/adr/0006-binary-dependency-provisioning.md))。
 - **lint**:`requires` 必須 resolve 到 `bin/registry.yaml`,且釘版 ≥ 各 requiring skill 的 `min`。
 
 ## 用法
