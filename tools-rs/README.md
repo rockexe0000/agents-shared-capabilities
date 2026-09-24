@@ -5,8 +5,8 @@ tooling. ADR 0008 unified the former node + POSIX-sh backends into this one stat
 The migration is complete: `capsync` is now the sole implementation — the node `tools/`
 reference backend and the sh pod-appliers were retired once per-axis byte parity held.
 
-Decision WHY / trade-offs: `agents-cold-memory:shared/adr/0008-tooling-rust-unification`.
-Work-list: the matching handoff (`…/handoffs/discord-1548114275158200351-tooling-rust-unification`).
+Decision WHY / trade-offs (ADR 0008) and the migration work-list (handoff) are indexed in
+[`../docs/design-notes.md`](../docs/design-notes.md).
 
 ## Scope (current)
 

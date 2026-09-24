@@ -1,6 +1,6 @@
 # 貢獻指南(Contributing)
 
-先讀 [README](README.md) 了解這個 catalog 的角色與 layout,再動手。設計與 WHY 在 ADR `agents-cold-memory:shared/adr/0002-agent-capability-provisioning`。
+先讀 [README](README.md) 了解這個 catalog 的角色與 layout,再動手。設計與 WHY(ADR)集中在 [`docs/design-notes.md`](docs/design-notes.md)。
 
 ## 核心原則
 
