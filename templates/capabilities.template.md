@@ -6,13 +6,13 @@ timestamp: "<ISO8601>"
 status: active
 layer: warm
 trigger: "Load when syncing/選擇 this agent 要啟用哪些 skill 或 MCP server。"
-cite_ref: agents-shared-memory:shared/capabilities-schema.md
 ---
 
 # Capabilities
 # per-agent 選擇清單(enable)。與授權正交:此檔決定「裝/載入哪些」,
 # permissions.md 決定「准不准跑」。預設全關 —— 只有列在下方的才會被 sync 投影。
 # 個人專屬能力(非 catalog)以 source: personal 標示,來源為 agent-bot/{uid}/{skills,mcp}/。
+# schema:agents-shared-capabilities:docs/capabilities-schema.md(cite_ref 為選用,不指向 memory repo)。
 
 skills:
   - name: hello-capability
