@@ -1470,50 +1470,124 @@ fn apply_authz(from: &Path, home: &Path) -> Result<Vec<String>, String> {
     Ok(applied)
 }
 
-/// Port of mcp-apply.js: merge a rendered {mcpServers:{...}} file's servers into a target
-/// JSON config, keeping every other key (Object.assign per-server; NO .bak, mirroring
-/// mcp-apply.js). openab-agent-mcp.json → ~/.openab/agent/mcp.json (facade sources; ${env:}
-/// refs preserved), runtime-mcp.json → ~/.claude.json (the oab-facade endpoint). Absent src
-/// or (bad target JSON) → treated as an empty base, exactly like mcp-apply.js.
+/// Reshape identity — claude-shaped targets (~/.claude.json, the facade sources file) store
+/// each rendered MCP entry verbatim.
+fn identity_entry(e: &Json) -> Json {
+    e.clone()
+}
+
+/// Reshape a claude-shaped rendered MCP entry (as written into runtime-mcp.json by
+/// `shape_server`) into the antigravity (agy / gemini CLI) shape: an http server's
+/// `{type:"http", url, headers?}` becomes `{serverUrl, headers?}`; a stdio server drops the
+/// `type` discriminator, keeping command/args/env. Mirrors the sync-path antigravity_entry vs
+/// claude_entry split, but operates on the already-rendered JSON (env `${...}` refs preserved)
+/// rather than a ResolvedServer, since `apply` consumes the rendered artifact.
+fn to_antigravity_entry(entry: &Json) -> Json {
+    let Json::Obj(fields) = entry else {
+        return entry.clone();
+    };
+    let get = |k: &str| {
+        fields
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    let ty = match get("type") {
+        Some(Json::Str(s)) => s,
+        _ => String::new(),
+    };
+    if ty == "http" {
+        let mut e: Vec<(String, Json)> = Vec::new();
+        if let Some(u) = get("url") {
+            e.push(("serverUrl".to_string(), u));
+        }
+        if let Some(h) = get("headers") {
+            e.push(("headers".to_string(), h));
+        }
+        Json::Obj(e)
+    } else {
+        // stdio (or unknown): keep every field except the `type` discriminator.
+        Json::Obj(
+            fields
+                .iter()
+                .filter(|(k, _)| k != "type")
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+/// Merge the `mcpServers` of a rendered `{mcpServers:{...}}` artifact into a target JSON config,
+/// Object.assign per-server, preserving every other key (NO .bak, mirroring mcp-apply.js).
+/// `reshape` transforms each server entry before insertion (identity for claude-shaped targets;
+/// claude→antigravity for the agy config). Absent src → Ok(false) (nothing merged); bad target
+/// JSON → treated as an empty base. Returns Ok(true) when the target was written.
+fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Result<bool, String> {
+    let Ok(add_text) = std::fs::read_to_string(src) else {
+        return Ok(false); // no such rendered MCP artifact
+    };
+    let add =
+        parse_json(&add_text).map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
+    // read target (bad/missing → {}), NO .bak — mirror mcp-apply.js.
+    let mut cur = std::fs::read_to_string(target)
+        .ok()
+        .and_then(|t| parse_json(&t).ok())
+        .filter(|j| matches!(j, Json::Obj(_)))
+        .unwrap_or_else(|| Json::Obj(Vec::new()));
+    let add_servers = match json_get(&add, "mcpServers") {
+        Some(Json::Obj(e)) => e.clone(),
+        _ => Vec::new(),
+    };
+    // cur.mcpServers = Object.assign(cur.mcpServers || {}, reshape(add.mcpServers) || {})
+    if !matches!(json_get(&cur, "mcpServers"), Some(Json::Obj(_))) {
+        if let Json::Obj(top) = &mut cur {
+            json_upsert(top, "mcpServers", Json::Obj(Vec::new()));
+        }
+    }
+    if let Some(Json::Obj(dst)) = json_get_mut(&mut cur, "mcpServers") {
+        for (k, v) in add_servers {
+            json_upsert(dst, &k, reshape(&v));
+        }
+    }
+    json_write_pretty(target, &cur)?;
+    Ok(true)
+}
+
+/// Port of mcp-apply.js: merge each rendered {mcpServers:{...}} file into its target config.
+/// openab-agent-mcp.json → ~/.openab/agent/mcp.json (facade sources; ${env:} refs preserved),
+/// runtime-mcp.json → ~/.claude.json (the oab-facade endpoint, claude shape). AND, when the agy
+/// runtime is present (~/.gemini exists, mirroring project_antigravity in the sync path),
+/// runtime-mcp.json → ~/.gemini/config/mcp_config.json, reshaped to the antigravity entry shape
+/// (`serverUrl` not `type`+`url`). Without that third target the pod's `capsync apply` only ever
+/// wrote the facade endpoint into ~/.claude.json — the one file agy never reads — so an
+/// antigravity agent saw zero MCP tools even with the facade + octobroker correctly wired.
 fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
-    let pairs: [(&str, PathBuf); 2] = [
+    let mut merged = Vec::new();
+    // Claude-shaped targets: facade sources + the runtime endpoint in ~/.claude.json.
+    let claude_pairs: [(&str, PathBuf); 2] = [
         (
             "openab-agent-mcp.json",
             home.join(".openab").join("agent").join("mcp.json"),
         ),
         ("runtime-mcp.json", home.join(".claude.json")),
     ];
-    let mut merged = Vec::new();
-    for (src_name, target) in pairs {
-        let src = from.join(src_name);
-        let Ok(add_text) = std::fs::read_to_string(&src) else {
-            continue; // no such rendered MCP artifact
-        };
-        let add = parse_json(&add_text)
-            .map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
-        // read target (bad/missing → {}), NO .bak — mirror mcp-apply.js.
-        let mut cur = std::fs::read_to_string(&target)
-            .ok()
-            .and_then(|t| parse_json(&t).ok())
-            .filter(|j| matches!(j, Json::Obj(_)))
-            .unwrap_or_else(|| Json::Obj(Vec::new()));
-        let add_servers = match json_get(&add, "mcpServers") {
-            Some(Json::Obj(e)) => e.clone(),
-            _ => Vec::new(),
-        };
-        // cur.mcpServers = Object.assign(cur.mcpServers || {}, add.mcpServers || {})
-        if !matches!(json_get(&cur, "mcpServers"), Some(Json::Obj(_))) {
-            if let Json::Obj(top) = &mut cur {
-                json_upsert(top, "mcpServers", Json::Obj(Vec::new()));
-            }
+    for (src_name, target) in claude_pairs {
+        if merge_mcp_into(&from.join(src_name), &target, identity_entry)? {
+            merged.push(src_name.to_string());
         }
-        if let Some(Json::Obj(dst)) = json_get_mut(&mut cur, "mcpServers") {
-            for (k, v) in add_servers {
-                json_upsert(dst, &k, v);
-            }
+    }
+    // Antigravity endpoint: agy reads ~/.gemini/config/mcp_config.json with a DIFFERENT entry
+    // shape than claude, so the claude-shaped runtime-mcp.json is reshaped on the way in. Gated
+    // on ~/.gemini so a claude/node pod (no agy runtime) is untouched.
+    if home.join(".gemini").exists() {
+        let target = home.join(".gemini").join("config").join("mcp_config.json");
+        if merge_mcp_into(
+            &from.join("runtime-mcp.json"),
+            &target,
+            to_antigravity_entry,
+        )? {
+            merged.push("runtime-mcp.json(antigravity)".to_string());
         }
-        json_write_pretty(&target, &cur)?;
-        merged.push(src_name.to_string());
     }
     Ok(merged)
 }
@@ -4087,6 +4161,28 @@ servers:
     #[test]
     fn mcp_empty_cfg() {
         assert_eq!(as_cfg(&[]), "{\n  \"mcpServers\": {}\n}\n");
+    }
+
+    #[test]
+    fn antigravity_entry_reshape() {
+        // http: claude {type,url,headers} → agy {serverUrl,headers} (drop `type`, url→serverUrl).
+        let http = parse_json(
+            "{\"type\":\"http\",\"url\":\"http://127.0.0.1:8848/mcp\",\"headers\":{\"X\":\"y\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            stringify(&to_antigravity_entry(&http), 0),
+            "{\n  \"serverUrl\": \"http://127.0.0.1:8848/mcp\",\n  \"headers\": {\n    \"X\": \"y\"\n  }\n}"
+        );
+        // stdio: drop the `type` discriminator, keep command/args/env verbatim.
+        let stdio =
+            parse_json("{\"type\":\"stdio\",\"command\":\"foo\",\"args\":[],\"env\":{}}").unwrap();
+        assert_eq!(
+            stringify(&to_antigravity_entry(&stdio), 0),
+            "{\n  \"command\": \"foo\",\n  \"args\": [],\n  \"env\": {}\n}"
+        );
+        // identity leaves claude-shaped entries untouched.
+        assert_eq!(stringify(&identity_entry(&http), 0), stringify(&http, 0));
     }
 
     #[test]

@@ -340,6 +340,24 @@ grep -q '"oab-facade"' "$mhr/.claude.json" && grep -q '"keep-me-too"' "$mhr/.cla
   || { echo "APPLY mcp: .claude.json merge wrong"; cat "$mhr/.claude.json"; fail=1; }
 echo "ok: apply (mcp)"
 
+# ---- apply mcp / antigravity endpoint ----
+# When the agy runtime is present (~/.gemini exists), the claude-shaped runtime-mcp.json is
+# ALSO reshaped into ~/.gemini/config/mcp_config.json using the agy entry shape (`serverUrl`,
+# not `type`+`url`) — the fix for "antigravity agent sees zero MCP tools". Pre-existing keys kept.
+seed_mcp_agy() {
+  mkdir -p "$1/.openab/agent" "$1/.gemini/config"
+  printf '{\n  "authState": "keep-me-too",\n  "mcpServers": {}\n}\n' > "$1/.claude.json"
+  printf '{\n  "keep-agy": "yes",\n  "mcpServers": {\n    "preexisting": { "serverUrl": "http://x" }\n  }\n}\n' > "$1/.gemini/config/mcp_config.json"
+}
+mhra="$tmp/mcphome_agy"; seed_mcp_agy "$mhra"
+HOME="$mhra" "$RUST_BIN" apply --from "$mrdir" >/dev/null 2>&1 || { echo "APPLY mcp(agy): rust apply errored"; fail=1; }
+agycfg="$mhra/.gemini/config/mcp_config.json"
+grep -q '"oab-facade"' "$agycfg" && grep -q '"serverUrl"' "$agycfg" \
+  && grep -q '"keep-agy"' "$agycfg" && grep -q '"preexisting"' "$agycfg" \
+  && ! grep -q '"type"' "$agycfg" && ! grep -q '"url":' "$agycfg" \
+  || { echo "APPLY mcp(agy): mcp_config.json reshape/merge wrong"; cat "$agycfg"; fail=1; }
+echo "ok: apply (mcp / antigravity)"
+
 # ---- apply bin (ADR 0008 Phase 4) ----
 # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
 # `capsync apply` must install the binary into BIN_INSTALL_DIR.
