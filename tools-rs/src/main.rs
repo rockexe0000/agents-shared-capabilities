@@ -2287,26 +2287,28 @@ fn match_effect(raw: &str) -> Option<String> {
 
 /// JS: raw.match(/^\s*-\s*name:\s*(\S[^\n]*?)\s*$/) group 1 — skill item name (block form;
 /// value is the trimmed remainder, which may contain spaces, unlike the MCP `name` token).
+/// JS ref took the raw remainder after `name:`; we additionally `strip()` it (drop surrounding
+/// quotes + inline comment), so a quoted scalar like `- name: "cfdrop"` yields `cfdrop`. Real
+/// capabilities.md files quote their scalars — without this the quotes leak into the name and
+/// the skill's catalog dir is never found (it is skipped as "source missing").
 fn match_skill_name(raw: &str) -> Option<String> {
     let r = raw.trim_start();
     let r = r.strip_prefix('-')?;
     let r = r.trim_start_matches([' ', '\t']);
     let r = r.strip_prefix("name:")?;
-    let r = r.trim_start_matches([' ', '\t']);
-    let v = r.trim_end();
+    let v = strip(r);
     if v.is_empty() {
         None
     } else {
-        Some(v.to_string())
+        Some(v)
     }
 }
 
-/// JS: raw.match(/^\s*source:\s*(\S+)/) group 1.
+/// JS: raw.match(/^\s*source:\s*(\S+)/) group 1, then `strip()` for quoted values (`"catalog"`).
 fn match_source(raw: &str) -> Option<String> {
     let r = raw.trim_start();
     let r = r.strip_prefix("source:")?;
-    let r = r.trim_start_matches([' ', '\t']);
-    let v: String = r.chars().take_while(|c| !c.is_whitespace()).collect();
+    let v = strip(r);
     if v.is_empty() {
         None
     } else {
@@ -2338,7 +2340,12 @@ fn is_servers_line(raw: &str) -> bool {
     raw.trim() == "servers:"
 }
 
-/// JS: raw.match(/^\s*-\s*\{?\s*name:\s*([A-Za-z0-9_-]+)/) group 1 (block or inline item).
+/// JS: raw.match(/^\s*-\s*\{?\s*name:\s*([A-Za-z0-9_-]+)/) group 1 (block or inline item),
+/// PLUS tolerance for a quoted scalar (`- name: "oab-facade"` / `'octobroker'`): a leading
+/// quote is stripped before the name chars are taken, and take_while stops at the closing quote.
+/// Real capabilities.md files quote MCP server names; without this the strict char class stops
+/// on the opening quote → empty → the server is silently dropped from the enable set → empty MCP
+/// render → an antigravity agent (or any) gets no MCP tools at all.
 fn match_dash_name(raw: &str) -> Option<String> {
     let r = raw.trim_start();
     let r = r.strip_prefix('-')?;
@@ -2347,6 +2354,7 @@ fn match_dash_name(raw: &str) -> Option<String> {
     let r = r.trim_start_matches([' ', '\t']);
     let r = r.strip_prefix("name:")?;
     let r = r.trim_start_matches([' ', '\t']);
+    let r = r.trim_start_matches(['"', '\'']);
     let name: String = r
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -4198,6 +4206,44 @@ servers:
         assert_eq!(
             match_dash_name("    - { name: beta }"),
             Some("beta".to_string())
+        );
+    }
+
+    #[test]
+    fn enable_matchers_quoted() {
+        // Real capabilities.md files quote their scalars; enable parse must strip the quotes.
+        assert_eq!(
+            match_dash_name("    - name: \"oab-facade\""),
+            Some("oab-facade".to_string())
+        );
+        assert_eq!(
+            match_dash_name("    - name: 'octobroker'"),
+            Some("octobroker".to_string())
+        );
+        // unquoted + inline-object forms still work.
+        assert_eq!(
+            match_dash_name("    - name: oab-facade"),
+            Some("oab-facade".to_string())
+        );
+        assert_eq!(
+            match_dash_name("    - { name: beta }"),
+            Some("beta".to_string())
+        );
+        assert_eq!(
+            match_skill_name("  - name: \"cfdrop\""),
+            Some("cfdrop".to_string())
+        );
+        assert_eq!(
+            match_skill_name("  - name: cfdrop"),
+            Some("cfdrop".to_string())
+        );
+        assert_eq!(
+            match_source("    source: \"catalog\""),
+            Some("catalog".to_string())
+        );
+        assert_eq!(
+            match_source("    source: personal"),
+            Some("personal".to_string())
         );
     }
 
