@@ -1218,13 +1218,13 @@ struct Perms {
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
-    mcp_flag: String,       // "auto" | "explicit" (authorize_mcp — MCP-tool grants)
-    mcp_allow: Vec<String>, // scopes from `use mcp` allow rules (server/tool or server/*)
+    mcp_flag: String, // "auto" | "explicit" (authorize_mcp_tools — MCP-tool grants)
+    mcp_allow: Vec<String>, // scopes from `run mcp tool` allow rules (server/tool or server/*)
     mcp_deny: Vec<String>,
 }
 
 const CMD_OPERATION: &str = "run command";
-const MCP_OPERATION: &str = "use mcp";
+const MCP_OPERATION: &str = "run mcp tool";
 
 /// Port of parsePermissions(text). Returns command names + MCP-tool scopes by effect bucket.
 fn parse_permissions(text: &str) -> Perms {
@@ -1239,7 +1239,7 @@ fn parse_permissions(text: &str) -> Perms {
     let mut cur: Option<(String, Option<String>, Option<String>)> = None;
 
     // flush buckets a completed rule by (operation, effect): `run command` → allow/deny/ask,
-    // `use mcp` → mcp_allow/mcp_deny (MCP has no ask bucket — an unlisted MCP tool just isn't
+    // `run mcp tool` → mcp_allow/mcp_deny (MCP has no ask bucket — an unlisted MCP tool just isn't
     // granted). Any other operation/effect combination is ignored (JS: out[effect] undefined).
     fn flush(cur: &mut Option<(String, Option<String>, Option<String>)>, out: &mut Perms) {
         let Some((effect, operation, scope)) = cur.take() else {
@@ -1273,7 +1273,7 @@ fn parse_permissions(text: &str) -> Perms {
         }
         // top-level flags (only before `rules:`)
         if !in_rules {
-            if let Some(v) = match_flag(t) {
+            if let Some(v) = match_skill_flag(t) {
                 out.flag = v;
                 continue;
             }
@@ -1343,13 +1343,13 @@ fn match_named_flag(t: &str, key: &str) -> Option<String> {
 }
 
 /// authorize_skill_requires: auto|explicit — controls command-grant derivation from skills.
-fn match_flag(t: &str) -> Option<String> {
+fn match_skill_flag(t: &str) -> Option<String> {
     match_named_flag(t, "authorize_skill_requires:")
 }
 
-/// authorize_mcp: auto|explicit — controls MCP-tool grant derivation from enabled servers.
+/// authorize_mcp_tools: auto|explicit — controls MCP-tool grant derivation from enabled servers.
 fn match_mcp_flag(t: &str) -> Option<String> {
-    match_named_flag(t, "authorize_mcp:")
+    match_named_flag(t, "authorize_mcp_tools:")
 }
 
 /// JS: t.match(/^-\s*effect:\s*(.+)$/) -> group 1. `t` is already trimmed.
@@ -1825,8 +1825,8 @@ struct Authz {
 /// list (used by suggest_text → authz-suggest.txt), sorted by command.
 ///
 /// MCP-tool authz is the orthogonal axis (the strict agy runtime gates `mcp(server/tool)`, unlike
-/// claude which doesn't): explicit mode uses only the permissions.md `use mcp` rules; auto mode
-/// (`authorize_mcp: auto`) additionally grants `<server>/*` for each enabled DIRECT-route server
+/// claude which doesn't): explicit mode uses only the permissions.md `run mcp tool` rules; auto
+/// mode (`authorize_mcp_tools: auto`) additionally grants `<server>/*` for each enabled DIRECT server
 /// (the servers the runtime connects to itself, e.g. oab-facade — facade-routed sources like
 /// octobroker are reached THROUGH the facade and need no runtime-level grant). deny always wins.
 fn build_authz(
@@ -4194,13 +4194,13 @@ rules:
 
     #[test]
     fn parse_permissions_mcp_rules_and_flag() {
-        let text = "authorize_mcp: explicit\n\
+        let text = "authorize_mcp_tools: explicit\n\
                     rules:\n\
                     \x20 - effect: \"allow\"\n\
-                    \x20   operation: \"use mcp\"\n\
+                    \x20   operation: \"run mcp tool\"\n\
                     \x20   scope: \"oab-facade/search_capabilities\"\n\
                     \x20 - effect: \"deny\"\n\
-                    \x20   operation: \"use mcp\"\n\
+                    \x20   operation: \"run mcp tool\"\n\
                     \x20   scope: \"oab-facade/execute_capability\"\n\
                     \x20 - effect: \"allow\"\n\
                     \x20   operation: \"run command\"\n\
