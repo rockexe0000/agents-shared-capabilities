@@ -1214,43 +1214,53 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 
 #[derive(Debug, Default, PartialEq)]
 struct Perms {
-    flag: String, // "auto" | "explicit"
+    flag: String, // "auto" | "explicit" (authorize_skill_requires — command grants)
     allow: Vec<String>,
     deny: Vec<String>,
     ask: Vec<String>,
+    mcp_flag: String, // "auto" | "explicit" (authorize_mcp_tools — MCP-tool grants)
+    mcp_allow: Vec<String>, // scopes from `run mcp tool` allow rules (server/tool or server/*)
+    mcp_deny: Vec<String>,
 }
 
 const CMD_OPERATION: &str = "run command";
+const MCP_OPERATION: &str = "run mcp tool";
 
-/// Port of parsePermissions(text). Returns command names by effect bucket.
+/// Port of parsePermissions(text). Returns command names + MCP-tool scopes by effect bucket.
 fn parse_permissions(text: &str) -> Perms {
     let body = strip_frontmatter(text);
     let mut out = Perms {
         flag: "explicit".into(),
+        mcp_flag: "explicit".into(),
         ..Default::default()
     };
     let mut in_rules = false;
     // current rule: (effect, operation_raw, scope)
     let mut cur: Option<(String, Option<String>, Option<String>)> = None;
 
-    // flush mirrors the JS closure: only `run command` rules with a scope land in a bucket.
+    // flush buckets a completed rule by (operation, effect): `run command` → allow/deny/ask,
+    // `run mcp tool` → mcp_allow/mcp_deny (MCP has no ask bucket — an unlisted MCP tool just isn't
+    // granted). Any other operation/effect combination is ignored (JS: out[effect] undefined).
     fn flush(cur: &mut Option<(String, Option<String>, Option<String>)>, out: &mut Perms) {
-        if let Some((effect, operation, scope)) = cur.take() {
-            let op_ok = operation.as_deref().map(strip).as_deref() == Some(CMD_OPERATION);
-            if !effect.is_empty() && op_ok {
-                if let Some(scope) = scope {
-                    let bucket = match effect.as_str() {
-                        "allow" => Some(&mut out.allow),
-                        "deny" => Some(&mut out.deny),
-                        "ask" => Some(&mut out.ask),
-                        _ => None, // other effects have no array bucket (JS: out[effect] undefined)
-                    };
-                    if let Some(b) = bucket {
-                        if !b.contains(&scope) {
-                            b.push(scope);
-                        }
-                    }
-                }
+        let Some((effect, operation, scope)) = cur.take() else {
+            return;
+        };
+        let Some(scope) = scope else { return };
+        if effect.is_empty() {
+            return;
+        }
+        let op = operation.as_deref().map(strip);
+        let bucket: Option<&mut Vec<String>> = match (op.as_deref(), effect.as_str()) {
+            (Some(CMD_OPERATION), "allow") => Some(&mut out.allow),
+            (Some(CMD_OPERATION), "deny") => Some(&mut out.deny),
+            (Some(CMD_OPERATION), "ask") => Some(&mut out.ask),
+            (Some(MCP_OPERATION), "allow") => Some(&mut out.mcp_allow),
+            (Some(MCP_OPERATION), "deny") => Some(&mut out.mcp_deny),
+            _ => None,
+        };
+        if let Some(b) = bucket {
+            if !b.contains(&scope) {
+                b.push(scope);
             }
         }
     }
@@ -1261,10 +1271,14 @@ fn parse_permissions(text: &str) -> Perms {
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        // top-level flag (only before `rules:`)
+        // top-level flags (only before `rules:`)
         if !in_rules {
-            if let Some(v) = match_flag(t) {
+            if let Some(v) = match_skill_flag(t) {
                 out.flag = v;
+                continue;
+            }
+            if let Some(v) = match_mcp_flag(t) {
+                out.mcp_flag = v;
                 continue;
             }
         }
@@ -1309,9 +1323,9 @@ fn strip_frontmatter(text: &str) -> String {
     text.to_string()
 }
 
-/// JS: t.match(/^authorize_skill_requires:\s*(auto|explicit)\b/) -> group 1.
-fn match_flag(t: &str) -> Option<String> {
-    let rest = t.strip_prefix("authorize_skill_requires:")?;
+/// JS: t.match(/^<key>\s*(auto|explicit)\b/) -> group 1. `key` includes the trailing colon.
+fn match_named_flag(t: &str, key: &str) -> Option<String> {
+    let rest = t.strip_prefix(key)?;
     let rest = rest.trim_start_matches([' ', '\t']);
     for kw in ["auto", "explicit"] {
         if let Some(after) = rest.strip_prefix(kw) {
@@ -1326,6 +1340,16 @@ fn match_flag(t: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// authorize_skill_requires: auto|explicit — controls command-grant derivation from skills.
+fn match_skill_flag(t: &str) -> Option<String> {
+    match_named_flag(t, "authorize_skill_requires:")
+}
+
+/// authorize_mcp_tools: auto|explicit — controls MCP-tool grant derivation from enabled servers.
+fn match_mcp_flag(t: &str) -> Option<String> {
+    match_named_flag(t, "authorize_mcp_tools:")
 }
 
 /// JS: t.match(/^-\s*effect:\s*(.+)$/) -> group 1. `t` is already trimmed.
@@ -1788,8 +1812,10 @@ struct Suggestion {
 
 struct Authz {
     flag: String,
-    allow: Vec<String>, // sorted, deny-subtracted
-    deny: Vec<String>,  // sorted
+    allow: Vec<String>,     // sorted, deny-subtracted (command scopes)
+    deny: Vec<String>,      // sorted (command scopes)
+    mcp_allow: Vec<String>, // sorted, deny-subtracted (MCP-tool scopes: server/tool or server/*)
+    mcp_deny: Vec<String>,  // sorted (MCP-tool scopes)
     suggestions: Vec<Suggestion>,
 }
 
@@ -1797,6 +1823,12 @@ struct Authz {
 /// auto mode (`authorize_skill_requires: auto`): additionally allow the commands the enabled
 /// skills' `requires` resolve to. deny always wins. `suggestions` is the requires-derived hint
 /// list (used by suggest_text → authz-suggest.txt), sorted by command.
+///
+/// MCP-tool authz is the orthogonal axis (the strict agy runtime gates `mcp(server/tool)`, unlike
+/// claude which doesn't): explicit mode uses only the permissions.md `run mcp tool` rules; auto
+/// mode (`authorize_mcp_tools: auto`) additionally grants `<server>/*` for each enabled DIRECT server
+/// (the servers the runtime connects to itself, e.g. oab-facade — facade-routed sources like
+/// octobroker are reached THROUGH the facade and need no runtime-level grant). deny always wins.
 fn build_authz(
     perms_text: &str,
     enable: &Enable,
@@ -1818,28 +1850,50 @@ fn build_authz(
             .filter(|c| !deny.contains(c))
             .collect(),
     );
+
+    let mcp_deny: BTreeSet<String> = perms.mcp_deny.iter().cloned().collect();
+    let mut mcp_allow_set: BTreeSet<String> = perms.mcp_allow.iter().cloned().collect();
+    if perms.mcp_flag == "auto" {
+        let registry = build_registry(catalog, base);
+        let (_facade, direct) = split_mcp_routes(enable, &registry);
+        for s in &direct {
+            mcp_allow_set.insert(format!("{}/*", s.name));
+        }
+    }
+    let mcp_allow: Vec<String> = js_sort(
+        mcp_allow_set
+            .into_iter()
+            .filter(|c| !mcp_deny.contains(c))
+            .collect(),
+    );
+
     Authz {
         flag: perms.flag,
         allow,
         deny: js_sort(deny.into_iter().collect()),
+        mcp_allow,
+        mcp_deny: js_sort(mcp_deny.into_iter().collect()),
         suggestions,
     }
 }
 
 struct Runtime {
     id: &'static str,
-    wrap: fn(&str) -> String,
+    wrap: fn(&str) -> String,     // command scope → runtime-native token
+    wrap_mcp: fn(&str) -> String, // MCP-tool scope (server/tool | server/*) → runtime-native token
 }
 
-// RUNTIME_AUTHZ: abstract "allow command X" -> runtime-native token.
+// RUNTIME_AUTHZ: abstract "allow command X" / "allow mcp Y" -> runtime-native token.
 const AUTHZ_RUNTIMES: &[Runtime] = &[
     Runtime {
         id: "antigravity",
         wrap: wrap_antigravity,
+        wrap_mcp: wrap_antigravity_mcp,
     },
     Runtime {
         id: "claude-code",
         wrap: wrap_claude,
+        wrap_mcp: wrap_claude_mcp,
     },
 ];
 
@@ -1850,6 +1904,20 @@ fn wrap_claude(cmd: &str) -> String {
     format!("Bash({cmd}:*)")
 }
 
+/// agy MCP permission scope: `mcp(server/tool)` (verbatim; also `mcp(server/*)` for a wildcard).
+fn wrap_antigravity_mcp(scope: &str) -> String {
+    format!("mcp({scope})")
+}
+/// claude MCP permission scope: `mcp__server__tool`; a `server/*` grant → the whole-server
+/// `mcp__server`. (claude does not hard-gate MCP, so this is a systematic no-op-safe projection.)
+fn wrap_claude_mcp(scope: &str) -> String {
+    match scope.split_once('/') {
+        Some((server, "*")) => format!("mcp__{server}"),
+        Some((server, tool)) => format!("mcp__{server}__{tool}"),
+        None => format!("mcp__{scope}"),
+    }
+}
+
 struct Mapped {
     allow: Vec<String>,
     deny: Vec<String>,
@@ -1857,10 +1925,13 @@ struct Mapped {
 
 /// Port of mapAuthz: apply one runtime's token wrapper to allow/deny (order preserved).
 fn map_authz(rt: &Runtime, a: &Authz) -> Mapped {
-    Mapped {
-        allow: a.allow.iter().map(|c| (rt.wrap)(c)).collect(),
-        deny: a.deny.iter().map(|c| (rt.wrap)(c)).collect(),
-    }
+    // command scopes first (unchanged), then MCP-tool scopes — so an agent with no MCP grants
+    // renders byte-identically to before (mcp_* empty → nothing appended).
+    let mut allow: Vec<String> = a.allow.iter().map(|c| (rt.wrap)(c)).collect();
+    allow.extend(a.mcp_allow.iter().map(|s| (rt.wrap_mcp)(s)));
+    let mut deny: Vec<String> = a.deny.iter().map(|c| (rt.wrap)(c)).collect();
+    deny.extend(a.mcp_deny.iter().map(|s| (rt.wrap_mcp)(s)));
+    Mapped { allow, deny }
 }
 
 /// JS Array.prototype.sort() default order: by UTF-16 code units. For the ASCII command
@@ -4093,12 +4164,52 @@ rules:
             flag: "explicit".into(),
             allow: vec!["cfdrop".into()],
             deny: vec![],
+            mcp_allow: vec![
+                "oab-facade/search_capabilities".into(),
+                "oab-facade/*".into(),
+            ],
+            mcp_deny: vec![],
             suggestions: Vec::new(),
         };
         let agy = map_authz(&AUTHZ_RUNTIMES[0], &a);
         let cc = map_authz(&AUTHZ_RUNTIMES[1], &a);
-        assert_eq!(agy.allow, vec!["command(cfdrop)"]);
-        assert_eq!(cc.allow, vec!["Bash(cfdrop:*)"]);
+        // command scopes first, then MCP-tool scopes, each in the runtime-native form.
+        assert_eq!(
+            agy.allow,
+            vec![
+                "command(cfdrop)",
+                "mcp(oab-facade/search_capabilities)",
+                "mcp(oab-facade/*)",
+            ]
+        );
+        assert_eq!(
+            cc.allow,
+            vec![
+                "Bash(cfdrop:*)",
+                "mcp__oab-facade__search_capabilities",
+                "mcp__oab-facade",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_mcp_rules_and_flag() {
+        let text = "authorize_mcp_tools: explicit\n\
+                    rules:\n\
+                    \x20 - effect: \"allow\"\n\
+                    \x20   operation: \"run mcp tool\"\n\
+                    \x20   scope: \"oab-facade/search_capabilities\"\n\
+                    \x20 - effect: \"deny\"\n\
+                    \x20   operation: \"run mcp tool\"\n\
+                    \x20   scope: \"oab-facade/execute_capability\"\n\
+                    \x20 - effect: \"allow\"\n\
+                    \x20   operation: \"run command\"\n\
+                    \x20   scope: \"cfdrop\"\n";
+        let p = parse_permissions(text);
+        assert_eq!(p.mcp_flag, "explicit");
+        assert_eq!(p.mcp_allow, vec!["oab-facade/search_capabilities"]);
+        assert_eq!(p.mcp_deny, vec!["oab-facade/execute_capability"]);
+        assert_eq!(p.allow, vec!["cfdrop"]); // command axis still parsed independently
     }
 
     const MCP_REG: &str = "\
@@ -4313,6 +4424,8 @@ tools:
             flag: "auto".into(),
             allow: js_sort(vec!["demotool".into()]),
             deny: vec![],
+            mcp_allow: vec![],
+            mcp_deny: vec![],
             suggestions: sug,
         };
         assert!(a_auto.allow.contains(&"demotool".to_string()));
@@ -4326,6 +4439,8 @@ tools:
             flag: "explicit".into(),
             allow: vec![],
             deny: vec![],
+            mcp_allow: vec![],
+            mcp_deny: vec![],
             suggestions: vec![],
         };
         assert_eq!(
