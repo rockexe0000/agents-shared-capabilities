@@ -1657,7 +1657,9 @@ fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
             }
         }
         let wrote = match &t.writer {
-            McpWriter::JsonMcpServers(reshape) => merge_mcp_into(&from.join(t.src), &t.target, *reshape)?,
+            McpWriter::JsonMcpServers(reshape) => {
+                merge_mcp_into(&from.join(t.src), &t.target, *reshape)?
+            }
             McpWriter::CodexToml => apply_codex_mcp(&from.join(t.src), &t.target)?,
         };
         if wrote {
@@ -1686,7 +1688,8 @@ fn apply_codex_mcp(src: &Path, target: &Path) -> Result<bool, String> {
     let Ok(text) = std::fs::read_to_string(src) else {
         return Ok(false); // no rendered MCP artifact
     };
-    let json = parse_json(&text).map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
+    let json =
+        parse_json(&text).map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
     let servers = match json_get(&json, "mcpServers") {
         Some(Json::Obj(e)) => e.clone(),
         _ => Vec::new(),
