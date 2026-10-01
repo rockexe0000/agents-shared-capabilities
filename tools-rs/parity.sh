@@ -358,6 +358,29 @@ grep -q '"oab-facade"' "$agycfg" && grep -q '"serverUrl"' "$agycfg" \
   || { echo "APPLY mcp(agy): mcp_config.json reshape/merge wrong"; cat "$agycfg"; fail=1; }
 echo "ok: apply (mcp / antigravity)"
 
+# ---- apply mcp / codex endpoint ----
+# codex-acp reads ~/.codex/config.toml ([mcp_servers.*] TOML). The claude-shaped runtime-mcp.json
+# is reconstructed into a managed block; a ${env:NAME} header becomes codex `env_http_headers`
+# (header → env-var NAME) — the path that carries OCTOBROKER_KEY to the facade. Gated on ~/.codex.
+mk_mcp_render_codex() {
+  mkdir -p "$1"
+  printf '{\n  "mcpServers": {\n    "oab-facade": {\n      "type": "http",\n      "url": "http://127.0.0.1:8848/mcp",\n      "headers": { "X-Octobroker-Key": "${env:OCTOBROKER_KEY}" }\n    }\n  }\n}\n' > "$1/runtime-mcp.json"
+}
+mrcx="$tmp/mcp_render_codex"; mk_mcp_render_codex "$mrcx"
+mhrc="$tmp/mcphome_codex"; mkdir -p "$mhrc/.codex"
+HOME="$mhrc" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(codex): rust apply errored"; fail=1; }
+cxcfg="$mhrc/.codex/config.toml"
+grep -q '\[mcp_servers.oab-facade\]' "$cxcfg" \
+  && grep -q 'url = "http://127.0.0.1:8848/mcp"' "$cxcfg" \
+  && grep -qF 'env_http_headers = { "X-Octobroker-Key" = "OCTOBROKER_KEY" }' "$cxcfg" \
+  && grep -qF '>>> agents-shared-capabilities (managed)' "$cxcfg" \
+  || { echo "APPLY mcp(codex): config.toml wrong"; cat "$cxcfg" 2>/dev/null; fail=1; }
+# a non-codex pod (no ~/.codex) must be untouched — gate holds
+mhrc2="$tmp/mcphome_nocodex"; mkdir -p "$mhrc2/.openab/agent"
+HOME="$mhrc2" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
+[ ! -e "$mhrc2/.codex/config.toml" ] || { echo "APPLY mcp(codex): wrote config.toml on a non-codex pod"; fail=1; }
+echo "ok: apply (mcp / codex)"
+
 # ---- apply bin (ADR 0008 Phase 4) ----
 # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
 # `capsync apply` must install the binary into BIN_INSTALL_DIR.
