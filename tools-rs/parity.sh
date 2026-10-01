@@ -381,6 +381,35 @@ HOME="$mhrc2" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
 [ ! -e "$mhrc2/.codex/config.toml" ] || { echo "APPLY mcp(codex): wrote config.toml on a non-codex pod"; fail=1; }
 echo "ok: apply (mcp / codex)"
 
+# ---- apply mcp / opencode (+ MiMo-Code fork) endpoint (Phase 1b) ----
+# opencode reads ~/.config/opencode/opencode.json under the `mcp` key with a reshaped entry
+# (`type:"remote"`, `url`, `enabled`, headers — NOT claude's `mcpServers`+`type:http`). The
+# ${env:} header ref is preserved. Pre-existing key/server kept. Gated on ~/.config/opencode.
+seed_mcp_opencode() {
+  mkdir -p "$1/.config/opencode"
+  printf '{\n  "$schema": "https://opencode.ai/config.json",\n  "mcp": {\n    "preexisting": { "type": "local", "command": ["foo"] }\n  }\n}\n' > "$1/.config/opencode/opencode.json"
+}
+mhro="$tmp/mcphome_opencode"; seed_mcp_opencode "$mhro"
+HOME="$mhro" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(opencode): rust apply errored"; fail=1; }
+ocfg="$mhro/.config/opencode/opencode.json"
+grep -q '"oab-facade"' "$ocfg" && grep -q '"type": "remote"' "$ocfg" \
+  && grep -q '"enabled": true' "$ocfg" && grep -qF '${env:OCTOBROKER_KEY}' "$ocfg" \
+  && grep -q '"preexisting"' "$ocfg" && grep -q 'opencode.ai/config.json' "$ocfg" \
+  && ! grep -q '"mcpServers"' "$ocfg" \
+  || { echo "APPLY mcp(opencode): opencode.json reshape/merge wrong"; cat "$ocfg"; fail=1; }
+# MiMo-Code fork: same shape, ~/.config/mimocode/mimocode.jsonc. Gated on ~/.config/mimocode.
+mhrm="$tmp/mcphome_mimo"; mkdir -p "$mhrm/.config/mimocode"
+HOME="$mhrm" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(mimo): rust apply errored"; fail=1; }
+mcfg="$mhrm/.config/mimocode/mimocode.jsonc"
+grep -q '"oab-facade"' "$mcfg" && grep -q '"type": "remote"' "$mcfg" && ! grep -q '"mcpServers"' "$mcfg" \
+  || { echo "APPLY mcp(mimo): mimocode.jsonc wrong"; cat "$mcfg" 2>/dev/null; fail=1; }
+# a non-opencode/mimo pod (neither dir) must be untouched — gate holds
+mhro2="$tmp/mcphome_noopencode"; mkdir -p "$mhro2/.openab/agent"
+HOME="$mhro2" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
+[ ! -e "$mhro2/.config/opencode/opencode.json" ] && [ ! -e "$mhro2/.config/mimocode/mimocode.jsonc" ] \
+  || { echo "APPLY mcp(opencode): wrote config on a pod without the runtime dir"; fail=1; }
+echo "ok: apply (mcp / opencode + mimo)"
+
 # ---- apply bin (ADR 0008 Phase 4) ----
 # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
 # `capsync apply` must install the binary into BIN_INSTALL_DIR.
