@@ -1585,32 +1585,60 @@ fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Resu
 /// (`serverUrl` not `type`+`url`). Without that third target the pod's `capsync apply` only ever
 /// wrote the facade endpoint into ~/.claude.json — the one file agy never reads — so an
 /// antigravity agent saw zero MCP tools even with the facade + octobroker correctly wired.
+/// One MCP apply target: which rendered artifact to merge, where to write it, how to reshape
+/// each entry on the way in, and (optionally) a runtime base dir that must exist for this
+/// target to apply. This is the DRY seam — adding a runtime's MCP projection is adding a row
+/// here (and, for non-`mcpServers`/non-JSON shapes, a new writer — tracked for Phase 1b).
+/// `gate: None` means always-apply (facade sources + the claude endpoint, preserved as-is).
+struct McpApplyTarget {
+    label: &'static str,
+    src: &'static str,
+    target: PathBuf,
+    reshape: fn(&Json) -> Json,
+    gate: Option<PathBuf>,
+}
+
+fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
+    vec![
+        // facade sources (${env:} refs preserved) — always.
+        McpApplyTarget {
+            label: "openab-agent-mcp.json",
+            src: "openab-agent-mcp.json",
+            target: home.join(".openab").join("agent").join("mcp.json"),
+            reshape: identity_entry,
+            gate: None,
+        },
+        // claude endpoint ~/.claude.json — always (claude shape, no reshape).
+        McpApplyTarget {
+            label: "runtime-mcp.json",
+            src: "runtime-mcp.json",
+            target: home.join(".claude.json"),
+            reshape: identity_entry,
+            gate: None,
+        },
+        // antigravity endpoint — agy reads ~/.gemini/config/mcp_config.json with a DIFFERENT
+        // entry shape (`serverUrl` not `type`+`url`); gated on ~/.gemini so a non-agy pod is
+        // untouched.
+        McpApplyTarget {
+            label: "runtime-mcp.json(antigravity)",
+            src: "runtime-mcp.json",
+            target: home.join(".gemini").join("config").join("mcp_config.json"),
+            reshape: to_antigravity_entry,
+            gate: Some(home.join(".gemini")),
+        },
+    ]
+}
+
 fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
     let mut merged = Vec::new();
-    // Claude-shaped targets: facade sources + the runtime endpoint in ~/.claude.json.
-    let claude_pairs: [(&str, PathBuf); 2] = [
-        (
-            "openab-agent-mcp.json",
-            home.join(".openab").join("agent").join("mcp.json"),
-        ),
-        ("runtime-mcp.json", home.join(".claude.json")),
-    ];
-    for (src_name, target) in claude_pairs {
-        if merge_mcp_into(&from.join(src_name), &target, identity_entry)? {
-            merged.push(src_name.to_string());
+    for t in mcp_apply_targets(home) {
+        if let Some(g) = &t.gate {
+            if !g.exists() {
+                continue; // runtime not present on this pod
+            }
         }
-    }
-    // Antigravity endpoint: agy reads ~/.gemini/config/mcp_config.json with a DIFFERENT entry
-    // shape than claude, so the claude-shaped runtime-mcp.json is reshaped on the way in. Gated
-    // on ~/.gemini so a claude/node pod (no agy runtime) is untouched.
-    if home.join(".gemini").exists() {
-        let target = home.join(".gemini").join("config").join("mcp_config.json");
-        if merge_mcp_into(
-            &from.join("runtime-mcp.json"),
-            &target,
-            to_antigravity_entry,
-        )? {
-            merged.push("runtime-mcp.json(antigravity)".to_string());
+        if merge_mcp_into(&from.join(t.src), &t.target, t.reshape)? {
+            merged.push(t.label.to_string());
         }
     }
     Ok(merged)
