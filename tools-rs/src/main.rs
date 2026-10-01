@@ -1585,16 +1585,25 @@ fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Resu
 /// (`serverUrl` not `type`+`url`). Without that third target the pod's `capsync apply` only ever
 /// wrote the facade endpoint into ~/.claude.json — the one file agy never reads — so an
 /// antigravity agent saw zero MCP tools even with the facade + octobroker correctly wired.
-/// One MCP apply target: which rendered artifact to merge, where to write it, how to reshape
-/// each entry on the way in, and (optionally) a runtime base dir that must exist for this
-/// target to apply. This is the DRY seam — adding a runtime's MCP projection is adding a row
-/// here (and, for non-`mcpServers`/non-JSON shapes, a new writer — tracked for Phase 1b).
-/// `gate: None` means always-apply (facade sources + the claude endpoint, preserved as-is).
+/// How an MCP apply target writes the rendered artifact into its runtime config file.
+/// `JsonMcpServers` = merge the (reshaped) entries into the target JSON's `mcpServers` map
+/// (claude / antigravity today; cursor/kiro/devin/kimi are the same family — Phase 1b).
+/// `CodexToml` = reconstruct a codex `[mcp_servers.*]` managed block (TOML) from the
+/// claude-shaped runtime-mcp.json. (opencode/mimo's `mcp`-key JSON shape is the next variant.)
+enum McpWriter {
+    JsonMcpServers(fn(&Json) -> Json),
+    CodexToml,
+}
+
+/// One MCP apply target: which rendered artifact, where to write it, how to write it, and
+/// (optionally) a runtime base dir that must exist for this target to apply. This is the DRY
+/// seam — adding a runtime's MCP projection is adding a row here (+ a writer variant only for a
+/// genuinely new file shape). `gate: None` = always-apply (facade sources + the claude endpoint).
 struct McpApplyTarget {
     label: &'static str,
     src: &'static str,
     target: PathBuf,
-    reshape: fn(&Json) -> Json,
+    writer: McpWriter,
     gate: Option<PathBuf>,
 }
 
@@ -1605,7 +1614,7 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "openab-agent-mcp.json",
             src: "openab-agent-mcp.json",
             target: home.join(".openab").join("agent").join("mcp.json"),
-            reshape: identity_entry,
+            writer: McpWriter::JsonMcpServers(identity_entry),
             gate: None,
         },
         // claude endpoint ~/.claude.json — always (claude shape, no reshape).
@@ -1613,7 +1622,7 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "runtime-mcp.json",
             src: "runtime-mcp.json",
             target: home.join(".claude.json"),
-            reshape: identity_entry,
+            writer: McpWriter::JsonMcpServers(identity_entry),
             gate: None,
         },
         // antigravity endpoint — agy reads ~/.gemini/config/mcp_config.json with a DIFFERENT
@@ -1623,8 +1632,18 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "runtime-mcp.json(antigravity)",
             src: "runtime-mcp.json",
             target: home.join(".gemini").join("config").join("mcp_config.json"),
-            reshape: to_antigravity_entry,
+            writer: McpWriter::JsonMcpServers(to_antigravity_entry),
             gate: Some(home.join(".gemini")),
+        },
+        // codex endpoint — codex-acp reads ~/.codex/config.toml ([mcp_servers.*] TOML managed
+        // block). Gated on ~/.codex so a non-codex pod is untouched. The codex image doesn't
+        // create ~/.codex until the CLI first runs, so a codex overlay pre-creates it in pre_boot.
+        McpApplyTarget {
+            label: "runtime-mcp.json(codex)",
+            src: "runtime-mcp.json",
+            target: home.join(".codex").join("config.toml"),
+            writer: McpWriter::CodexToml,
+            gate: Some(home.join(".codex")),
         },
     ]
 }
@@ -1637,11 +1656,116 @@ fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
                 continue; // runtime not present on this pod
             }
         }
-        if merge_mcp_into(&from.join(t.src), &t.target, t.reshape)? {
+        let wrote = match &t.writer {
+            McpWriter::JsonMcpServers(reshape) => {
+                merge_mcp_into(&from.join(t.src), &t.target, *reshape)?
+            }
+            McpWriter::CodexToml => apply_codex_mcp(&from.join(t.src), &t.target)?,
+        };
+        if wrote {
             merged.push(t.label.to_string());
         }
     }
     Ok(merged)
+}
+
+/// `${env:NAME}` → `Some("NAME")` (the codex env_http_headers form); anything else → None.
+fn env_ref_name(v: &str) -> Option<String> {
+    v.strip_prefix("${env:")
+        .and_then(|r| r.strip_suffix('}'))
+        .filter(|n| !n.is_empty())
+        .map(|n| n.to_string())
+}
+
+/// Reconstruct a codex `[mcp_servers.*]` managed block from the claude-shaped runtime-mcp.json
+/// and write it into ~/.codex/config.toml (strip prior managed block, append fresh — mirrors the
+/// sync-path project_codex write tail). Byte-structure mirrors codex_to_toml: http servers emit
+/// `url` + `http_headers` (literal) + `env_http_headers` (the ${env:NAME} refs, detected from the
+/// preserved ref form); stdio servers emit command/args and an `[mcp_servers.<name>.env]` subtable.
+/// (stdio env values stay in ${env:} ref form — apply has the ref, not the resolved value; codex's
+/// facade server is http-only so this doesn't affect the live case.)
+fn apply_codex_mcp(src: &Path, target: &Path) -> Result<bool, String> {
+    let Ok(text) = std::fs::read_to_string(src) else {
+        return Ok(false); // no rendered MCP artifact
+    };
+    let json =
+        parse_json(&text).map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
+    let servers = match json_get(&json, "mcpServers") {
+        Some(Json::Obj(e)) => e.clone(),
+        _ => Vec::new(),
+    };
+    let mut out = vec![CODEX_BEGIN.to_string()];
+    for (name, entry) in &servers {
+        out.push(format!("[mcp_servers.{}]", name));
+        let is_http = matches!(json_get(entry, "type"), Some(Json::Str(t)) if t == "http")
+            || json_get(entry, "url").is_some();
+        if is_http {
+            if let Some(Json::Str(u)) = json_get(entry, "url") {
+                out.push(format!("url = {}", toml_q(u)));
+            }
+            let mut lit: Vec<String> = Vec::new();
+            let mut env_h: Vec<String> = Vec::new();
+            if let Some(Json::Obj(hs)) = json_get(entry, "headers") {
+                for (k, v) in hs {
+                    if let Json::Str(sv) = v {
+                        match env_ref_name(sv) {
+                            Some(n) => env_h.push(format!("{} = {}", toml_q(k), toml_q(&n))),
+                            None => lit.push(format!("{} = {}", toml_q(k), toml_q(sv))),
+                        }
+                    }
+                }
+            }
+            if !lit.is_empty() {
+                out.push(format!("http_headers = {{ {} }}", lit.join(", ")));
+            }
+            if !env_h.is_empty() {
+                out.push(format!("env_http_headers = {{ {} }}", env_h.join(", ")));
+            }
+        } else {
+            if let Some(Json::Str(c)) = json_get(entry, "command") {
+                out.push(format!("command = {}", toml_q(c)));
+            }
+            let args: Vec<String> = match json_get(entry, "args") {
+                Some(Json::Arr(a)) => a.iter().map(|x| toml_q(&json_scalar_string(x))).collect(),
+                _ => Vec::new(),
+            };
+            out.push(format!("args = [{}]", args.join(", ")));
+            if let Some(Json::Obj(env)) = json_get(entry, "env") {
+                let nonempty: Vec<&(String, Json)> = env
+                    .iter()
+                    .filter(|(_, v)| !matches!(v, Json::Str(s) if s.is_empty()))
+                    .collect();
+                if !nonempty.is_empty() {
+                    out.push(format!("[mcp_servers.{}.env]", name));
+                    for (k, v) in nonempty {
+                        out.push(format!("{} = {}", k, toml_q(&json_scalar_string(v))));
+                    }
+                }
+            }
+        }
+        out.push(String::new()); // blank line after each server
+    }
+    out.push(CODEX_END.to_string());
+    let block = out.join("\n");
+
+    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    if !existing.is_empty() {
+        let mut bak = target.to_path_buf().into_os_string();
+        bak.push(".bak");
+        let _ = std::fs::copy(target, PathBuf::from(bak));
+    }
+    let stripped = strip_managed_block(&existing, CODEX_BEGIN, CODEX_END);
+    let stripped = stripped.trim_end();
+    let next = if stripped.is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{stripped}\n\n{block}\n")
+    };
+    if let Some(p) = target.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+    }
+    std::fs::write(target, next).map_err(|e| format!("write {}: {e}", target.display()))?;
+    Ok(true)
 }
 
 /// Port of bin-apply.sh via capsync's install machinery: read the rendered bin-install.tsv,
