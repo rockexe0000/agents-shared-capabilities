@@ -2,7 +2,8 @@
 
 跨 Coding Agent 的**能力供給正本**:Agent Skills 與 MCP(Model Context Protocol)servers 的單一 catalog,投影進各 runtime(Claude Code、Codex、Antigravity、opencode…)。
 
-> 設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。
+> 設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。per-runtime 的 MCP 投影路徑/格式矩陣與
+> apply registry 的擴充方式見 [`docs/runtime-projection.md`](docs/runtime-projection.md)。
 > 本 repo 只承載**集體 catalog**;個人專屬能力放該 agent 的 cold 命名空間 `agent-bot/{uid}/{skills,mcp}/`。
 
 ## 兩道閘
@@ -26,8 +27,11 @@ templates/                    # SKILL / mcp-server / hook / bin-tool / capabilit
                               #  local dev 自行 export。dotenv-file 後備已退場,ADR 0008 Decision 6)
 tools-rs/                     # capsync:單一 static Rust binary,承載全部能力投影工具
   src/main.rs                 #   render / --check / sync / apply / --check-tools / lint
-                              #   投影目標:claude-code / codex / antigravity(direct:skills +
-                              #   MCP config + hooks)、oab-facade(facade:~/.openab/agent/mcp.json)
+                              #   MCP 投影:sync(off-pod)直寫 claude-code / codex / antigravity /
+                              #   opencode;apply(on-pod)由 render 產物 reshape 進各 runtime
+                              #   (claude / antigravity / codex / opencode / mimo;cursor/kiro/devin/
+                              #   kimi/grok 規劃中)。per-runtime 路徑/格式矩陣 + 如何加一個 runtime:
+                              #   見 docs/runtime-projection.md。facade → ~/.openab/agent/mcp.json
                               #   (ADR 0008:node tools/ + sh pod-applier 已退役,capsync 為唯一實作)
 ```
 
