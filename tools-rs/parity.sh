@@ -410,6 +410,55 @@ HOME="$mhro2" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
   || { echo "APPLY mcp(opencode): wrote config on a pod without the runtime dir"; fail=1; }
 echo "ok: apply (mcp / opencode + mimo)"
 
+# ---- apply mcp / cursor + kiro + kimi (plain mcpServers, strip `type`) (Phase 1b) ----
+# All three read `mcpServers` with the remote entry `{url, headers}` (NO `type`). Different paths:
+# cursor ~/.cursor/mcp.json, kiro ~/.kiro/settings/mcp.json, kimi ~/.kimi-code/mcp.json. Gated on
+# each runtime's dir. The ${env:} header ref is preserved; pre-existing key/server kept.
+check_plain_mcp() {  # <home> <relpath> <runtime-label>
+  local cfg="$1/$2" rt="$3"
+  grep -q '"oab-facade"' "$cfg" && grep -qF '${env:OCTOBROKER_KEY}' "$cfg" \
+    && grep -q '"keep-me"' "$cfg" && grep -q '"preexisting"' "$cfg" \
+    && ! grep -q '"type"' "$cfg" && ! grep -q '"transport"' "$cfg" && ! grep -q '"serverUrl"' "$cfg" \
+    || { echo "APPLY mcp($rt): $2 reshape/merge wrong"; cat "$cfg"; fail=1; }
+}
+seed_plain() {  # <home> <dir-to-make> <config-relpath>
+  mkdir -p "$1/$2"
+  printf '{\n  "someKey": "keep-me",\n  "mcpServers": {\n    "preexisting": { "command": "foo" }\n  }\n}\n' > "$1/$3"
+}
+# cursor
+mhcur="$tmp/mcphome_cursor"; seed_plain "$mhcur" ".cursor" ".cursor/mcp.json"
+HOME="$mhcur" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(cursor): rust apply errored"; fail=1; }
+check_plain_mcp "$mhcur" ".cursor/mcp.json" cursor
+# kiro (config under settings/)
+mhki="$tmp/mcphome_kiro"; seed_plain "$mhki" ".kiro/settings" ".kiro/settings/mcp.json"
+HOME="$mhki" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(kiro): rust apply errored"; fail=1; }
+check_plain_mcp "$mhki" ".kiro/settings/mcp.json" kiro
+# kimi
+mhkm="$tmp/mcphome_kimi"; seed_plain "$mhkm" ".kimi-code" ".kimi-code/mcp.json"
+HOME="$mhkm" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(kimi): rust apply errored"; fail=1; }
+check_plain_mcp "$mhkm" ".kimi-code/mcp.json" kimi
+echo "ok: apply (mcp / cursor + kiro + kimi)"
+
+# ---- apply mcp / devin (mcpServers, type→transport:"http") (Phase 1b) ----
+# devin reads ~/.config/devin/mcp_config.json; http uses `transport:"http"` + `url` (not serverUrl).
+mhdv="$tmp/mcphome_devin"; mkdir -p "$mhdv/.config/devin"
+printf '{\n  "keep-dv": "yes",\n  "mcpServers": {}\n}\n' > "$mhdv/.config/devin/mcp_config.json"
+HOME="$mhdv" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(devin): rust apply errored"; fail=1; }
+dvcfg="$mhdv/.config/devin/mcp_config.json"
+grep -q '"oab-facade"' "$dvcfg" && grep -q '"transport": "http"' "$dvcfg" && grep -q '"url"' "$dvcfg" \
+  && grep -q '"keep-dv"' "$dvcfg" && grep -qF '${env:OCTOBROKER_KEY}' "$dvcfg" \
+  && ! grep -q '"type"' "$dvcfg" && ! grep -q '"serverUrl"' "$dvcfg" \
+  || { echo "APPLY mcp(devin): mcp_config.json reshape wrong"; cat "$dvcfg"; fail=1; }
+echo "ok: apply (mcp / devin)"
+
+# a pod with none of these runtime dirs must be untouched — gates hold
+mhnone="$tmp/mcphome_noplain"; mkdir -p "$mhnone/.openab/agent"
+HOME="$mhnone" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
+{ [ ! -e "$mhnone/.cursor/mcp.json" ] && [ ! -e "$mhnone/.kiro/settings/mcp.json" ] \
+  && [ ! -e "$mhnone/.kimi-code/mcp.json" ] && [ ! -e "$mhnone/.config/devin/mcp_config.json" ]; } \
+  || { echo "APPLY mcp(plain/devin): wrote config on a pod without the runtime dir"; fail=1; }
+echo "ok: apply (mcp / cursor+kiro+kimi+devin gates)"
+
 # ---- apply bin (ADR 0008 Phase 4) ----
 # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
 # `capsync apply` must install the binary into BIN_INSTALL_DIR.

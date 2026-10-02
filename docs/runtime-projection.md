@@ -71,7 +71,7 @@ JSON reshape + a per-runtime gate.
 | axis | render artifact(s) | `sync` | `apply` | runtimes today |
 |------|--------------------|:------:|:-------:|----------------|
 | **authz** | `authz-<rt>.json` (+`authz-suggest.txt`) | — | ✅ | claude-code, antigravity |
-| **mcp** | `runtime-mcp.json`, `openab-agent-mcp.json` | ✅ | ✅ | sync: claude/codex/antigravity/opencode · apply: + mimo (+ facade) |
+| **mcp** | `runtime-mcp.json`, `openab-agent-mcp.json` | ✅ | ✅ | sync: claude/codex/antigravity/opencode · apply: + mimo/cursor/kiro/kimi/devin (+ facade); grok planned, pi N/A |
 | **skills** | `skills.tar.b64`, `skills.list` | ✅ per-runtime | ✅ single dir | sync: claude/codex/antigravity/opencode |
 | **bin** | `bin-install.tsv` | ✅ `--with-tools` | ✅ | runtime-agnostic (`~/bin` on PATH) |
 | **hooks** | — (not rendered yet) | ✅ | — (Phase 4) | claude-code, antigravity |
@@ -113,10 +113,10 @@ every runtime connects to.
 | Codex | `~/.codex/config.toml` | `[mcp_servers.*]` TOML | `url` + `http_headers` + `env_http_headers` (`${env:NAME}`) | ✅ | ✅ |
 | opencode | `~/.config/opencode/opencode.json` | `mcp` | `{type:"remote", url, enabled:true, headers?}` | ✅ | ✅ |
 | MiMo-Code | `~/.config/mimocode/mimocode.jsonc` | `mcp` | = opencode (fork) | — | ✅ |
-| Cursor | `~/.cursor/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | planned |
-| Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | planned |
-| Devin | `~/.config/devin/mcp_config.json` | `mcpServers` | `{url, transport:"http", headers?}` | — | planned |
-| Kimi Code | `~/.kimi-code/mcp.json` | `mcpServers` | `{url, headers?}` (http = no transport; sse = `transport:"sse"`) | — | planned |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | ✅ |
+| Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | ✅ |
+| Devin | `~/.config/devin/mcp_config.json` | `mcpServers` | `{url, transport:"http", headers?}` | — | ✅ |
+| Kimi Code | `~/.kimi-code/mcp.json` | `mcpServers` | `{url, headers?}` (http = no transport; sse = `transport:"sse"`) | — | ✅ |
 | Grok | `~/.grok/config.toml` | `[mcp_servers.*]` TOML (≈ codex) | TBC — medium confidence | — | planned |
 | Pi | — | — | — | — | N/A — no MCP by design |
 
