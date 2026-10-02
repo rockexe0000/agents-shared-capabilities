@@ -1,89 +1,178 @@
 ---
-title: "Runtime Projection — MCP matrix & the apply registry"
+title: "Runtime Projection — sync vs apply, and the five axes"
 ---
 
-> Reference for **how a catalog MCP server reaches each Coding Agent runtime** — the two
-> projection paths, the per-runtime config path + entry shape, and the DRY `apply` registry you
-> extend to add a runtime. Design rationale for the tooling unification: [ADR 0008](adr/0008-tooling-rust-unification.md).
-> The MCP *route* (facade vs direct) is orthogonal and covered in the root [README](../README.md#mcp-route預設-facade).
+> How a catalog capability reaches each Coding Agent runtime: the **two projection paths**
+> (`sync` off-pod, `apply` on-pod) and, for each of the **five axes** (authz / mcp / skills / bin /
+> hooks), the per-runtime target, shape, and current coverage. Tooling-unification rationale:
+> [ADR 0008](adr/0008-tooling-rust-unification.md). Per-axis design ADRs:
+> [0002](adr/0002-agent-capability-provisioning.md) (skills+mcp) ·
+> [0005](adr/0005-hook-capability-provisioning.md) (hooks) ·
+> [0006](adr/0006-binary-dependency-provisioning.md) (bin) ·
+> [0007](adr/0007-authorization-projection.md) (authz). The MCP *route* (facade vs direct) is
+> orthogonal and lives in the root [README](../README.md#mcp-route預設-facade).
 
-## Two projection paths
+## Two projection paths: `sync` vs `apply`
 
-Both are `capsync` subcommands over the same catalog; they differ in *where* they run and *what*
-they consume.
+Both are `capsync` subcommands over the same catalog. They differ in **where they run** and **what
+they consume**.
 
-| path | command | runs | writes from | covers |
-|------|---------|------|-------------|--------|
-| **sync** (off-pod / dev) | `capsync sync` | a dev box with the runtimes installed | the catalog + the agent's `capabilities.md`, directly | the runtime config files it finds installed |
-| **apply** (on-pod) | `capsync apply --from <dir>` | the pod, in `pre_boot` | the **render artifacts** a prior `capsync --render` wrote (`runtime-mcp.json` = the claude-shaped endpoint; `openab-agent-mcp.json` = the facade sources) | every runtime whose base dir exists on the pod |
+- **`sync`** (off-pod / dev) — reads the catalog + the agent's `capabilities.md` **live**, computes
+  each runtime's config, and writes it straight into `$HOME`. One shot: compute **and** write.
+- **`apply --from <dir>`** (on-pod) — the pod has **no catalog checkout**. It consumes a bundle of
+  **pre-rendered artifacts** (`capsync --render` wrote them to `$HOME/.cap-render`) and projects
+  those into each runtime. It is the path pods actually take, in `pre_boot`.
 
-`apply` is the path pods actually take (ADR 0008 Phase 4): an ephemeral init renders all axes into
-`$HOME/.cap-render`, then one `capsync apply` projects them. It reshapes the single claude-shaped
-`runtime-mcp.json` into each runtime's own config shape, gated so a runtime absent from the pod is
-left untouched (no-op).
+| | `sync` (off-pod) | `apply` (on-pod) |
+|---|---|---|
+| runs | dev box, manual / opt-in | pod `pre_boot`, automatic |
+| input | catalog + `capabilities.md` (live) | render artifacts (`~/.cap-render`) |
+| MCP data form | `ResolvedServer` (structured: transport/url/headers/command/env) | already-rendered **claude-shaped JSON** |
+| axes | skills · mcp · hooks (· bin with `--with-tools`) | authz · mcp · skills · bin (**no hooks yet**) |
+| per-runtime gate | each projector checks the runtime is installed | `gate` = the runtime's base dir exists |
 
-## MCP config matrix
+### The pipeline (the `render` step in the middle)
 
-The rendered `runtime-mcp.json` is **claude-shaped**: an http server is `{type:"http", url,
-headers?}`, a stdio server is `{command, args, env}`. Each runtime's column below is what that entry
-is reshaped into. `env:`/`${env:}` secret refs are preserved verbatim (resolved by the runtime or
-the facade, never inlined).
+```
+dev :  catalog + capabilities.md  ──sync───────────────────▶  runtime configs
+pod :  catalog + capabilities.md  ──render──▶ ~/.cap-render ──apply──▶  runtime configs
+          (ephemeral init, has catalog)        (artifacts)    (pre_boot, no catalog)
+```
 
-| runtime | MCP config path | top-level key | remote (http) entry shape | sync | apply |
-|---------|-----------------|---------------|---------------------------|:----:|:-----:|
+`sync` fuses *compute* and *write*. The pod splits them: an **ephemeral init** (catalog cloned at a
+pinned ref) runs `--render` to compute every axis into `~/.cap-render`; the main container's
+`pre_boot` then runs `apply`, which needs **only the artifacts** — no catalog, no toolchain, and no
+network for the local axes.
+
+### Why split (ADR 0008 option-C)
+
+1. **Clean pod image** — the main container carries no catalog and no Rust toolchain.
+2. **Single source of truth + drift check** — `capsync --check <dir>` deterministically re-renders
+   and diffs the committed artifacts, so CI/cron catch catalog-vs-artifact drift (fail loud).
+3. **Fail-closed authz** — the init's render assertion is the security gate; `apply` runs authz
+   first and each axis independently, so a later (network) bin hiccup never skips the security axis.
+
+### Why some shape logic appears twice
+
+A runtime's "reshape to its native config" exists in **two forms** because the two paths hold
+different inputs:
+
+- `sync` has a `ResolvedServer` (transport/url/headers are separate fields) → it builds the native
+  entry directly (`claude_entry`, `opencode_entry`, …).
+- `apply` has only the **rendered claude-shaped JSON** (the catalog detail was flattened at render
+  time) → it does a **JSON→JSON reshape** (`to_opencode_entry`, `apply_codex_mcp`, …).
+
+They produce the **same target shape** by different means. The multi-runtime work (opencode/mimo,
+and next cursor/kiro/devin/kimi/grok) extends the **`apply`** side — the path pods take — so it is
+JSON reshape + a per-runtime gate.
+
+## The five axes at a glance
+
+| axis | render artifact(s) | `sync` | `apply` | runtimes today |
+|------|--------------------|:------:|:-------:|----------------|
+| **authz** | `authz-<rt>.json` (+`authz-suggest.txt`) | — | ✅ | claude-code, antigravity |
+| **mcp** | `runtime-mcp.json`, `openab-agent-mcp.json` | ✅ | ✅ | sync: claude/codex/antigravity/opencode · apply: + mimo (+ facade) |
+| **skills** | `skills.tar.b64`, `skills.list` | ✅ per-runtime | ✅ single dir | sync: claude/codex/antigravity/opencode |
+| **bin** | `bin-install.tsv` | ✅ `--with-tools` | ✅ | runtime-agnostic (`~/bin` on PATH) |
+| **hooks** | — (not rendered yet) | ✅ | — (Phase 4) | claude-code, antigravity |
+
+Legend: ✅ implemented · — not on this path. Each axis's projector **gates on the runtime being
+present** (base dir exists) → a runtime absent from a pod is a no-op.
+
+---
+
+### authz (ADR 0007)
+
+Projects the agent's permission decisions into each runtime's settings, from the rendered
+`authz-<runtime>.json` (`{allow, deny}`). **`apply`-only** (`sync` leaves a dev's own runtime
+permissions alone). Merge semantics (RMW + `.bak`, mirroring `perms-apply.sh`): `permissions.allow`
+is **replaced** (projection owns the allowlist → GC-correct), `permissions.deny` is the **union** of
+existing ∪ managed (deny never auto-drops); every other setting is preserved.
+
+| runtime | settings file | scope shape |
+|---------|---------------|-------------|
+| Claude Code | `~/.claude/settings.json` | `Tool(spec)` / MCP `Server/tool` (`wrap_claude` / `wrap_claude_mcp`) |
+| Antigravity | `~/.gemini/antigravity-cli/settings.json` | `action(target)` (`wrap_antigravity`) |
+
+Planned (Phase 3): the list-model runtimes (cursor / opencode / kimi / kiro / grok) and codex's
+non-list `approval_policy` + `sandbox_mode`; pi has no authz model. `autoApprove` (kiro) and other
+per-tool fields belong to this axis, not MCP.
+
+### mcp (ADR 0002)
+
+The rendered `runtime-mcp.json` is **claude-shaped** (http → `{type:"http", url, headers?}`, stdio →
+`{command, args, env}`); each runtime's column is what that entry is reshaped into. `env:`/`${env:}`
+secret refs are preserved verbatim (resolved by the runtime or the facade, never inlined). The
+facade sources go to `~/.openab/agent/mcp.json`; the facade endpoint is the one claude-shaped server
+every runtime connects to.
+
+| runtime | MCP config path | key | remote (http) entry shape | sync | apply |
+|---------|-----------------|-----|---------------------------|:----:|:-----:|
 | Claude Code | `~/.claude.json` | `mcpServers` | `{type:"http", url, headers?}` (identity) | ✅ | ✅ |
 | Antigravity | `~/.gemini/config/mcp_config.json` | `mcpServers` | `{serverUrl, headers?}` | ✅ | ✅ |
-| Codex | `~/.codex/config.toml` | `[mcp_servers.*]` (TOML managed block) | `url` + `http_headers` (literal) + `env_http_headers` (`${env:NAME}` refs) | ✅ | ✅ |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.*]` TOML | `url` + `http_headers` + `env_http_headers` (`${env:NAME}`) | ✅ | ✅ |
 | opencode | `~/.config/opencode/opencode.json` | `mcp` | `{type:"remote", url, enabled:true, headers?}` | ✅ | ✅ |
-| MiMo-Code | `~/.config/mimocode/mimocode.jsonc` | `mcp` | = opencode (fork, same shape) | — | ✅ |
+| MiMo-Code | `~/.config/mimocode/mimocode.jsonc` | `mcp` | = opencode (fork) | — | ✅ |
 | Cursor | `~/.cursor/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | planned |
-| Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`; `autoApprove`/`disabled` are the authz axis, not projected) | — | planned |
+| Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | planned |
 | Devin | `~/.config/devin/mcp_config.json` | `mcpServers` | `{url, transport:"http", headers?}` | — | planned |
 | Kimi Code | `~/.kimi-code/mcp.json` | `mcpServers` | `{url, headers?}` (http = no transport; sse = `transport:"sse"`) | — | planned |
-| Grok | `~/.grok/config.toml` | `[mcp_servers.*]` (TOML, ≈ codex) | TBC — medium confidence, verified when implemented | — | planned |
-| Pi | — | — | — | — | N/A — Pi has no MCP support by design |
+| Grok | `~/.grok/config.toml` | `[mcp_servers.*]` TOML (≈ codex) | TBC — medium confidence | — | planned |
+| Pi | — | — | — | — | N/A — no MCP by design |
 
-Legend: ✅ implemented · — not on this path · planned (Phase 1b, researched, not yet coded) · N/A.
-stdio entries follow the same per-runtime rules (e.g. opencode uses `command: [cmd, ...args]` +
-`environment`); the live facade server is http, so the http column is the hot path.
+**Family grouping (shared writer ≠ shared shape).** The `mcpServers`-key runtimes share the
+*writer* (merge reshaped entries into a `mcpServers` map) but need **four distinct reshapes**:
+identity (claude, keeps `type:"http"`) · strip `type` → `{url, headers}` (cursor / kiro / kimi) ·
+`type`→`transport:"http"` (devin) · `type`+`url`→`serverUrl` (antigravity). opencode/mimo are a
+separate `mcp`-key JSON; codex/grok are TOML managed blocks.
 
-### Family grouping (shared writer ≠ shared shape)
+**The `apply` MCP registry (the DRY seam)** — table-driven in `tools-rs/src/main.rs`:
 
-The `mcpServers`-key runtimes share the **writer mechanism** (merge the reshaped entries into a
-JSON `mcpServers` map) but **not the entry shape** — three distinct reshapes cover them:
+- `McpApplyTarget` — one row per `{src artifact, target path, writer, gate}`. `gate: None` =
+  always-apply (facade sources + the claude endpoint); `gate: Some(dir)` = only if that runtime
+  base dir exists.
+- `McpWriter` — `JsonMcpServers { key, reshape }` (merge into the target JSON's `<key>` map) or
+  `CodexToml` (reconstruct a `[mcp_servers.*]` TOML managed block; grok will reuse it).
+- `mcp_apply_targets(home)` returns the rows; `apply_mcp` iterates them (gate → writer).
 
-- **identity** — Claude (keeps `type:"http"`).
-- **strip `type`** → `{url, headers}` — Cursor, Kiro, Kimi.
-- **`type`→`transport`** → `{url, transport:"http", headers}` — Devin.
-- **`type`+`url`→`serverUrl`** → `{serverUrl, headers}` — Antigravity.
+*Adding a runtime:* add one row; reuse a reshape/writer if the shape matches, else add a small
+`reshape` fn (like `to_opencode_entry`) for a new entry shape or a `McpWriter` variant for a new
+file shape; add a `parity.sh` assertion (+ a negative no-op test). No render-side change is needed —
+`apply` reshapes the already-rendered `runtime-mcp.json`, so existing agents' golden is unaffected.
 
-opencode/mimo are a separate `mcp`-key JSON shape; codex/grok are TOML managed blocks.
+### skills (ADR 0002)
 
-## The apply registry (the DRY seam)
+Rendered as `skills.tar.b64` + `skills.list` (the enabled skills' `SKILL.md` trees). Each runtime
+treats its skills dir as "installed" when its base dir exists.
 
-On-pod MCP projection is table-driven in `tools-rs/src/main.rs`:
+- **`sync`** — per-runtime **symlinks** (`SKILL_RUNTIMES`): Claude `~/.claude/skills`, Codex
+  `~/.codex/skills`, Antigravity `~/.gemini/antigravity-cli/skills`, opencode
+  `~/.config/opencode/skills`.
+- **`apply`** — extracts the tar into a **single** `SKILLS_DIR` (default `~/.claude/skills`; env
+  override), GC'd against a `.catalog-managed` marker.
 
-- **`McpApplyTarget`** — one row per `{src artifact, target path, writer, gate}`. `gate: Some(dir)`
-  means "only apply if that runtime base dir exists on the pod"; `gate: None` is always-apply
-  (facade sources + the claude endpoint).
-- **`McpWriter`** — how a target writes:
-  - `JsonMcpServers { key, reshape }` — merge the reshaped entries into the target JSON's `<key>`
-    map (`mcpServers` for claude/antigravity/cursor/kiro/devin/kimi; `mcp` for opencode/mimo).
-  - `CodexToml` — reconstruct a `[mcp_servers.*]` TOML managed block (codex; grok will reuse this
-    family).
-- **`mcp_apply_targets(home)`** returns the rows; **`apply_mcp`** iterates them (gate → writer).
+> ⚠️ **Known gaps (Phase 2):** `apply` skills is single-dir, not per-runtime like `sync`; and the
+> Codex skills path should be `~/.agents/skills` (official), not `~/.codex/skills`. Both are tracked
+> for the per-runtime skills pass.
 
-### Adding a runtime
+### bin (ADR 0006)
 
-1. Add one `McpApplyTarget` row to `mcp_apply_targets` — its config path, `gate` = its base dir,
-   and a `writer`.
-2. Reuse an existing reshape/writer if the shape matches (see the family grouping); add a new
-   `reshape` fn (a few lines, like `to_opencode_entry`) only for a genuinely new entry shape, or a
-   new `McpWriter` variant only for a new *file* shape (e.g. a second TOML dialect).
-3. Add a `parity.sh` assertion: seed the runtime's config dir, `apply`, assert the reshaped entry
-   landed under the right key — plus a negative test that a pod lacking the dir is untouched.
-4. Keep every existing runtime a no-op: the gate guarantees it, and `tools-rs-parity` enforces that
-   the render golden stays byte-identical.
+Rendered as `bin-install.tsv` (the pinned CLI closure of enabled skills' `requires`). Both
+`sync --with-tools` and `apply` fetch → verify sha256 → extract into the install dir
+(`BIN_INSTALL_DIR`, else `~/.local/bin` if on PATH), lockfile-idempotent, GC'ing no-longer-required
+tools. **Runtime-agnostic**: there is no per-runtime bin mechanism — every runtime just needs the
+managed bin dir on PATH. This is the one axis that is a single shared implementation.
 
-No render-side change is needed to add an `apply` target — `apply` reshapes the already-rendered
-`runtime-mcp.json`, so existing agents' rendered artifacts (and their golden) are unaffected.
+### hooks (ADR 0005)
+
+Canonical events (`CANONICAL_HOOK_EVENTS`): `pre-tool`, `post-tool`, `session-start`, `stop`,
+`user-prompt-submit`, mapped to each runtime's native event name (unmapped → skip). Only
+`effect: allow` hooks are projected; the projector rewrites a managed block (strip prior, write
+fresh) so a now-disabled hook is removed.
+
+- **`sync`** — Claude `~/.claude/settings.json` (`hooks`) via `project_claude_hooks`; Antigravity
+  `~/.gemini/config/hooks.json` via `project_antigravity_hooks`.
+- **`apply`** — **not yet**: hooks are not among the rendered artifacts, and `apply_cmd` runs only
+  authz/mcp/skills/bin. **Phase 4** adds a hook render artifact + an `apply_hooks` axis (and the
+  registry-driven per-runtime projectors for the other hook-capable runtimes: codex / cursor / kimi
+  settings-hooks, kiro `.kiro/hooks/*.json`; opencode/mimo/pi are plugin-only → N/A).

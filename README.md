@@ -2,8 +2,9 @@
 
 跨 Coding Agent 的**能力供給正本**:Agent Skills 與 MCP(Model Context Protocol)servers 的單一 catalog,投影進各 runtime(Claude Code、Codex、Antigravity、opencode…)。
 
-> 設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。per-runtime 的 MCP 投影路徑/格式矩陣與
-> apply registry 的擴充方式見 [`docs/runtime-projection.md`](docs/runtime-projection.md)。
+> 設計與 WHY(ADR)收錄於 [`docs/adr/`](docs/adr/)。投影架構(`sync` off-pod vs `apply` on-pod)、
+> 五軸(authz/mcp/skills/bin/hooks)各自的 per-runtime 路徑/格式/涵蓋,與 apply registry 的
+> 擴充方式,見 [`docs/runtime-projection.md`](docs/runtime-projection.md)。
 > 本 repo 只承載**集體 catalog**;個人專屬能力放該 agent 的 cold 命名空間 `agent-bot/{uid}/{skills,mcp}/`。
 
 ## 兩道閘
