@@ -459,6 +459,27 @@ HOME="$mhnone" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
   || { echo "APPLY mcp(plain/devin): wrote config on a pod without the runtime dir"; fail=1; }
 echo "ok: apply (mcp / cursor+kiro+kimi+devin gates)"
 
+# ---- apply mcp / grok endpoint (TOML, single inline headers) (Phase 1b) ----
+# grok reads ~/.grok/config.toml ([mcp_servers.*] TOML). Unlike codex, http uses a SINGLE inline
+# `headers = { ... }` table (no http_headers/env_http_headers split); the ${env:NAME} ref is
+# rewritten to grok's ${NAME} interpolation form. Gated on ~/.grok. Pre-existing content kept.
+mhgk="$tmp/mcphome_grok"; mkdir -p "$mhgk/.grok"
+printf 'model = "keep-me"\n' > "$mhgk/.grok/config.toml"
+HOME="$mhgk" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || { echo "APPLY mcp(grok): rust apply errored"; fail=1; }
+gkcfg="$mhgk/.grok/config.toml"
+grep -q '\[mcp_servers.oab-facade\]' "$gkcfg" \
+  && grep -q 'url = "http://127.0.0.1:8848/mcp"' "$gkcfg" \
+  && grep -qF 'headers = { "X-Octobroker-Key" = "${OCTOBROKER_KEY}" }' "$gkcfg" \
+  && grep -q 'model = "keep-me"' "$gkcfg" \
+  && ! grep -q 'env_http_headers' "$gkcfg" && ! grep -q 'http_headers' "$gkcfg" \
+  && ! grep -qF '${env:' "$gkcfg" \
+  || { echo "APPLY mcp(grok): config.toml wrong"; cat "$gkcfg" 2>/dev/null; fail=1; }
+# a non-grok pod (no ~/.grok) must be untouched — gate holds
+mhgk2="$tmp/mcphome_nogrok"; mkdir -p "$mhgk2/.openab/agent"
+HOME="$mhgk2" "$RUST_BIN" apply --from "$mrcx" >/dev/null 2>&1 || true
+[ ! -e "$mhgk2/.grok/config.toml" ] || { echo "APPLY mcp(grok): wrote config on a non-grok pod"; fail=1; }
+echo "ok: apply (mcp / grok)"
+
 # ---- apply bin (ADR 0008 Phase 4) ----
 # Rendered bin-install.tsv pointing at the file:// fake asset (reused from --with-tools):
 # `capsync apply` must install the binary into BIN_INSTALL_DIR.

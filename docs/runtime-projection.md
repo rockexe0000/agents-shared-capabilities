@@ -71,7 +71,7 @@ JSON reshape + a per-runtime gate.
 | axis | render artifact(s) | `sync` | `apply` | runtimes today |
 |------|--------------------|:------:|:-------:|----------------|
 | **authz** | `authz-<rt>.json` (+`authz-suggest.txt`) | — | ✅ | claude-code, antigravity |
-| **mcp** | `runtime-mcp.json`, `openab-agent-mcp.json` | ✅ | ✅ | sync: claude/codex/antigravity/opencode · apply: + mimo/cursor/kiro/kimi/devin (+ facade); grok planned, pi N/A |
+| **mcp** | `runtime-mcp.json`, `openab-agent-mcp.json` | ✅ | ✅ | sync: claude/codex/antigravity/opencode · apply: + mimo/cursor/kiro/kimi/devin/grok (+ facade); pi N/A |
 | **skills** | `skills.tar.b64`, `skills.list` | ✅ per-runtime | ✅ single dir | sync: claude/codex/antigravity/opencode |
 | **bin** | `bin-install.tsv` | ✅ `--with-tools` | ✅ | runtime-agnostic (`~/bin` on PATH) |
 | **hooks** | — (not rendered yet) | ✅ | — (Phase 4) | claude-code, antigravity |
@@ -117,14 +117,19 @@ every runtime connects to.
 | Kiro | `~/.kiro/settings/mcp.json` | `mcpServers` | `{url, headers?}` (no `type`) | — | ✅ |
 | Devin | `~/.config/devin/mcp_config.json` | `mcpServers` | `{url, transport:"http", headers?}` | — | ✅ |
 | Kimi Code | `~/.kimi-code/mcp.json` | `mcpServers` | `{url, headers?}` (http = no transport; sse = `transport:"sse"`) | — | ✅ |
-| Grok | `~/.grok/config.toml` | `[mcp_servers.*]` TOML (≈ codex) | TBC — medium confidence | — | planned |
+| Grok | `~/.grok/config.toml` | `[mcp_servers.*]` TOML | `url` + single inline `headers = {…}` (`${env:NAME}`→grok's `${NAME}`) | — | ✅¹ |
 | Pi | — | — | — | — | N/A — no MCP by design |
+
+¹ Grok header-value interpolation (`${VAR}`) is medium-confidence (official docs show the
+`headers` table + `${VAR}` env syntax but don't spell out header interpolation); no live grok
+runtime exists yet, so this is forward-looking + gated no-op until confirmed on a grok pod.
 
 **Family grouping (shared writer ≠ shared shape).** The `mcpServers`-key runtimes share the
 *writer* (merge reshaped entries into a `mcpServers` map) but need **four distinct reshapes**:
 identity (claude, keeps `type:"http"`) · strip `type` → `{url, headers}` (cursor / kiro / kimi) ·
 `type`→`transport:"http"` (devin) · `type`+`url`→`serverUrl` (antigravity). opencode/mimo are a
-separate `mcp`-key JSON; codex/grok are TOML managed blocks.
+separate `mcp`-key JSON; codex/grok are TOML managed blocks (different shapes: codex splits
+`http_headers`/`env_http_headers`, grok uses one inline `headers` table).
 
 **The `apply` MCP registry (the DRY seam)** — table-driven in `tools-rs/src/main.rs`:
 
@@ -132,7 +137,8 @@ separate `mcp`-key JSON; codex/grok are TOML managed blocks.
   always-apply (facade sources + the claude endpoint); `gate: Some(dir)` = only if that runtime
   base dir exists.
 - `McpWriter` — `JsonMcpServers { key, reshape }` (merge into the target JSON's `<key>` map) or
-  `CodexToml` (reconstruct a `[mcp_servers.*]` TOML managed block; grok will reuse it).
+  `CodexToml` / `GrokToml` (each reconstructs a `[mcp_servers.*]` TOML managed block — codex
+  splits `http_headers`/`env_http_headers`, grok uses one inline `headers` table).
 - `mcp_apply_targets(home)` returns the rows; `apply_mcp` iterates them (gate → writer).
 
 *Adding a runtime:* add one row; reuse a reshape/writer if the shape matches, else add a small
