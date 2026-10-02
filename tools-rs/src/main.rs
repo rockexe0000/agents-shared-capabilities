@@ -1594,6 +1594,57 @@ fn to_opencode_entry(entry: &Json) -> Json {
     }
 }
 
+/// Reshape a claude-shaped rendered MCP entry into the "plain `mcpServers`" shape used by
+/// **Cursor** (`~/.cursor/mcp.json`), **Kiro** (`~/.kiro/settings/mcp.json`), and **Kimi Code**
+/// (`~/.kimi-code/mcp.json`): an http server drops the `type` discriminator → `{url, headers?}`;
+/// a stdio server (`{command, args, env}`, no `type`) is kept as-is. (Kimi's sse variant would set
+/// `transport:"sse"`, but the facade is http, which is "url, no transport" = exactly this.) Verified
+/// against each runtime's official MCP docs; see docs/runtime-projection.md.
+fn to_plain_mcp_entry(entry: &Json) -> Json {
+    match entry {
+        Json::Obj(fields) => Json::Obj(
+            fields
+                .iter()
+                .filter(|(k, _)| k != "type")
+                .cloned()
+                .collect(),
+        ),
+        _ => entry.clone(),
+    }
+}
+
+/// Reshape a claude-shaped rendered MCP entry into the **Devin** shape
+/// (`~/.config/devin/mcp_config.json`, `mcpServers`): an http server's `type:"http"` discriminator
+/// is renamed to `transport:"http"` (field is `url`, NOT `serverUrl` — per the official Devin CLI
+/// docs), keeping url + headers; a stdio server is kept as-is (strip `type`). See
+/// docs/runtime-projection.md.
+fn to_devin_entry(entry: &Json) -> Json {
+    let Json::Obj(fields) = entry else {
+        return entry.clone();
+    };
+    let get = |k: &str| {
+        fields
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    let is_http =
+        matches!(get("type"), Some(Json::Str(ref s)) if s == "http") || get("url").is_some();
+    if is_http {
+        let mut e = Vec::new();
+        if let Some(u) = get("url") {
+            e.push(("url".to_string(), u));
+        }
+        e.push(("transport".to_string(), Json::Str("http".to_string())));
+        if let Some(h) = get("headers") {
+            e.push(("headers".to_string(), h));
+        }
+        Json::Obj(e)
+    } else {
+        to_plain_mcp_entry(entry)
+    }
+}
+
 /// Merge the `mcpServers` of a rendered `{mcpServers:{...}}` artifact into a target JSON config's
 /// `target_key` map, Object.assign per-server, preserving every other key (NO .bak, mirroring
 /// mcp-apply.js). The rendered artifact is always claude-shaped (`mcpServers`); `target_key` is the
@@ -1746,6 +1797,51 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
                 reshape: to_opencode_entry,
             },
             gate: Some(home.join(".config").join("mimocode")),
+        },
+        // cursor / kiro / kimi — all `mcpServers`-key JSON whose remote entry is the "plain"
+        // shape `{url, headers}` (drop the `type` discriminator). Same reshape, different path +
+        // gate. Each no-op on a pod lacking its runtime dir.
+        McpApplyTarget {
+            label: "runtime-mcp.json(cursor)",
+            src: "runtime-mcp.json",
+            target: home.join(".cursor").join("mcp.json"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: to_plain_mcp_entry,
+            },
+            gate: Some(home.join(".cursor")),
+        },
+        McpApplyTarget {
+            label: "runtime-mcp.json(kiro)",
+            src: "runtime-mcp.json",
+            target: home.join(".kiro").join("settings").join("mcp.json"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: to_plain_mcp_entry,
+            },
+            gate: Some(home.join(".kiro")),
+        },
+        McpApplyTarget {
+            label: "runtime-mcp.json(kimi)",
+            src: "runtime-mcp.json",
+            target: home.join(".kimi-code").join("mcp.json"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: to_plain_mcp_entry,
+            },
+            gate: Some(home.join(".kimi-code")),
+        },
+        // devin — `mcpServers`-key JSON, but the http discriminator is `transport:"http"` (not
+        // `type`), field `url` (not `serverUrl`). Gated on ~/.config/devin.
+        McpApplyTarget {
+            label: "runtime-mcp.json(devin)",
+            src: "runtime-mcp.json",
+            target: home.join(".config").join("devin").join("mcp_config.json"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: to_devin_entry,
+            },
+            gate: Some(home.join(".config").join("devin")),
         },
     ]
 }
