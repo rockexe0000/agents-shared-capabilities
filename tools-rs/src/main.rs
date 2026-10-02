@@ -1703,13 +1703,16 @@ fn merge_mcp_into(
 /// for opencode / mimo; `reshape` maps a claude-shaped rendered entry into the target runtime's
 /// entry shape (identity for claude, `to_antigravity_entry`, `to_opencode_entry`, …).
 /// `CodexToml` = reconstruct a codex `[mcp_servers.*]` managed block (TOML) from the
-/// claude-shaped runtime-mcp.json. (grok's TOML is the next variant — Phase 1b.)
+/// claude-shaped runtime-mcp.json (http → `url` + `http_headers` + `env_http_headers`).
+/// `GrokToml` = same `[mcp_servers.*]` TOML family but grok's shape: a SINGLE inline `headers`
+/// table (no http_headers/env_http_headers split) with `${env:NAME}` rewritten to grok's `${NAME}`.
 enum McpWriter {
     JsonMcpServers {
         key: &'static str,
         reshape: fn(&Json) -> Json,
     },
     CodexToml,
+    GrokToml,
 }
 
 /// One MCP apply target: which rendered artifact, where to write it, how to write it, and
@@ -1843,6 +1846,15 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             },
             gate: Some(home.join(".config").join("devin")),
         },
+        // grok — `[mcp_servers.*]` TOML managed block in ~/.grok/config.toml. Same TOML family as
+        // codex but a single inline `headers` table (no env_http_headers split). Gated on ~/.grok.
+        McpApplyTarget {
+            label: "runtime-mcp.json(grok)",
+            src: "runtime-mcp.json",
+            target: home.join(".grok").join("config.toml"),
+            writer: McpWriter::GrokToml,
+            gate: Some(home.join(".grok")),
+        },
     ]
 }
 
@@ -1859,6 +1871,7 @@ fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
                 merge_mcp_into(&from.join(t.src), &t.target, key, *reshape)?
             }
             McpWriter::CodexToml => apply_codex_mcp(&from.join(t.src), &t.target)?,
+            McpWriter::GrokToml => apply_grok_mcp(&from.join(t.src), &t.target)?,
         };
         if wrote {
             merged.push(t.label.to_string());
@@ -1938,6 +1951,107 @@ fn apply_codex_mcp(src: &Path, target: &Path) -> Result<bool, String> {
                     for (k, v) in nonempty {
                         out.push(format!("{} = {}", k, toml_q(&json_scalar_string(v))));
                     }
+                }
+            }
+        }
+        out.push(String::new()); // blank line after each server
+    }
+    out.push(CODEX_END.to_string());
+    let block = out.join("\n");
+
+    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    if !existing.is_empty() {
+        let mut bak = target.to_path_buf().into_os_string();
+        bak.push(".bak");
+        let _ = std::fs::copy(target, PathBuf::from(bak));
+    }
+    let stripped = strip_managed_block(&existing, CODEX_BEGIN, CODEX_END);
+    let stripped = stripped.trim_end();
+    let next = if stripped.is_empty() {
+        format!("{block}\n")
+    } else {
+        format!("{stripped}\n\n{block}\n")
+    };
+    if let Some(p) = target.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("mkdir {}: {e}", p.display()))?;
+    }
+    std::fs::write(target, next).map_err(|e| format!("write {}: {e}", target.display()))?;
+    Ok(true)
+}
+
+/// `${env:NAME}` → `${NAME}` (grok's `${VAR}` interpolation form); anything else unchanged.
+fn grok_val(v: &str) -> String {
+    match env_ref_name(v) {
+        Some(n) => format!("${{{}}}", n),
+        None => v.to_string(),
+    }
+}
+
+/// Reconstruct a grok `[mcp_servers.*]` managed block from the claude-shaped runtime-mcp.json and
+/// write it into ~/.grok/config.toml (strip prior managed block, append fresh — same mechanics as
+/// apply_codex_mcp). Grok's shape differs from codex: an http server emits `url` + a SINGLE inline
+/// `headers = { "K" = "V" }` table (NOT codex's http_headers/env_http_headers split); a stdio
+/// server emits command/args + a single inline `env = { ... }` table. Grok interpolates `${VAR}`,
+/// so the rendered `${env:NAME}` refs are rewritten to `${NAME}`.
+///
+/// NOTE: grok header-value interpolation (`${VAR}`) is the one medium-confidence point — the
+/// official config docs show `headers = { … }` and `${VAR}` env interpolation but don't spell out
+/// header-value interpolation explicitly. No live grok runtime exists yet and this target is gated
+/// on ~/.grok, so it is forward-looking + no-op until a grok pod exists; confirm there.
+fn apply_grok_mcp(src: &Path, target: &Path) -> Result<bool, String> {
+    let Ok(text) = std::fs::read_to_string(src) else {
+        return Ok(false); // no rendered MCP artifact
+    };
+    let json =
+        parse_json(&text).map_err(|_| format!("apply: invalid JSON in {}", src.display()))?;
+    let servers = match json_get(&json, "mcpServers") {
+        Some(Json::Obj(e)) => e.clone(),
+        _ => Vec::new(),
+    };
+    let mut out = vec![CODEX_BEGIN.to_string()];
+    for (name, entry) in &servers {
+        out.push(format!("[mcp_servers.{}]", name));
+        let is_http = matches!(json_get(entry, "type"), Some(Json::Str(t)) if t == "http")
+            || json_get(entry, "url").is_some();
+        if is_http {
+            if let Some(Json::Str(u)) = json_get(entry, "url") {
+                out.push(format!("url = {}", toml_q(u)));
+            }
+            if let Some(Json::Obj(hs)) = json_get(entry, "headers") {
+                let parts: Vec<String> = hs
+                    .iter()
+                    .filter_map(|(k, v)| match v {
+                        Json::Str(sv) => Some(format!("{} = {}", toml_q(k), toml_q(&grok_val(sv)))),
+                        _ => None,
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    out.push(format!("headers = {{ {} }}", parts.join(", ")));
+                }
+            }
+        } else {
+            if let Some(Json::Str(c)) = json_get(entry, "command") {
+                out.push(format!("command = {}", toml_q(c)));
+            }
+            let args: Vec<String> = match json_get(entry, "args") {
+                Some(Json::Arr(a)) => a.iter().map(|x| toml_q(&json_scalar_string(x))).collect(),
+                _ => Vec::new(),
+            };
+            out.push(format!("args = [{}]", args.join(", ")));
+            if let Some(Json::Obj(env)) = json_get(entry, "env") {
+                let parts: Vec<String> = env
+                    .iter()
+                    .filter(|(_, v)| !matches!(v, Json::Str(s) if s.is_empty()))
+                    .map(|(k, v)| {
+                        format!(
+                            "{} = {}",
+                            toml_q(k),
+                            toml_q(&grok_val(&json_scalar_string(v)))
+                        )
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    out.push(format!("env = {{ {} }}", parts.join(", ")));
                 }
             }
         }
