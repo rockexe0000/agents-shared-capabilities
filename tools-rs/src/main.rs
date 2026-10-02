@@ -1541,12 +1541,72 @@ fn to_antigravity_entry(entry: &Json) -> Json {
     }
 }
 
-/// Merge the `mcpServers` of a rendered `{mcpServers:{...}}` artifact into a target JSON config,
-/// Object.assign per-server, preserving every other key (NO .bak, mirroring mcp-apply.js).
-/// `reshape` transforms each server entry before insertion (identity for claude-shaped targets;
-/// claude→antigravity for the agy config). Absent src → Ok(false) (nothing merged); bad target
-/// JSON → treated as an empty base. Returns Ok(true) when the target was written.
-fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Result<bool, String> {
+/// Reshape a claude-shaped rendered MCP entry into the opencode (and MiMo-Code fork) shape:
+/// an http server `{type:"http", url, headers?}` becomes `{type:"remote", url, enabled:true,
+/// headers?}`; a stdio server `{command, args, env}` becomes `{type:"local", command:[cmd,
+/// ...args], enabled:true, environment?}`. Mirrors the sync-path `opencode_entry` (field order,
+/// the `enabled:true` flag, command-as-array, `environment` key) but operates on the already-
+/// rendered JSON (env `${...}` refs preserved), since `apply` consumes the rendered artifact.
+/// The live facade case is http → remote; the stdio branch keeps parity for direct stdio servers.
+fn to_opencode_entry(entry: &Json) -> Json {
+    let Json::Obj(fields) = entry else {
+        return entry.clone();
+    };
+    let get = |k: &str| {
+        fields
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    let is_http =
+        matches!(get("type"), Some(Json::Str(ref s)) if s == "http") || get("url").is_some();
+    if is_http {
+        let mut e = vec![("type".to_string(), Json::Str("remote".to_string()))];
+        if let Some(u) = get("url") {
+            e.push(("url".to_string(), u));
+        }
+        e.push(("enabled".to_string(), Json::Bool(true)));
+        if let Some(h) = get("headers") {
+            e.push(("headers".to_string(), h));
+        }
+        Json::Obj(e)
+    } else {
+        // stdio: command is a single string in the claude shape; opencode wants [cmd, ...args].
+        let mut cmd: Vec<Json> = Vec::new();
+        if let Some(Json::Str(c)) = get("command") {
+            cmd.push(Json::Str(c));
+        }
+        if let Some(Json::Arr(a)) = get("args") {
+            cmd.extend(a);
+        }
+        let mut e = vec![
+            ("type".to_string(), Json::Str("local".to_string())),
+            ("command".to_string(), Json::Arr(cmd)),
+            ("enabled".to_string(), Json::Bool(true)),
+        ];
+        // only emit `environment` when non-empty (mirrors opencode_entry).
+        if let Some(Json::Obj(env)) = get("env") {
+            if !env.is_empty() {
+                e.push(("environment".to_string(), Json::Obj(env)));
+            }
+        }
+        Json::Obj(e)
+    }
+}
+
+/// Merge the `mcpServers` of a rendered `{mcpServers:{...}}` artifact into a target JSON config's
+/// `target_key` map, Object.assign per-server, preserving every other key (NO .bak, mirroring
+/// mcp-apply.js). The rendered artifact is always claude-shaped (`mcpServers`); `target_key` is the
+/// DESTINATION map key (`mcpServers` for claude/antigravity, `mcp` for opencode/mimo). `reshape`
+/// transforms each server entry before insertion (identity for claude-shaped targets;
+/// claude→antigravity / claude→opencode for the others). Absent src → Ok(false) (nothing merged);
+/// bad target JSON → treated as an empty base. Returns Ok(true) when the target was written.
+fn merge_mcp_into(
+    src: &Path,
+    target: &Path,
+    target_key: &str,
+    reshape: fn(&Json) -> Json,
+) -> Result<bool, String> {
     let Ok(add_text) = std::fs::read_to_string(src) else {
         return Ok(false); // no such rendered MCP artifact
     };
@@ -1558,17 +1618,18 @@ fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Resu
         .and_then(|t| parse_json(&t).ok())
         .filter(|j| matches!(j, Json::Obj(_)))
         .unwrap_or_else(|| Json::Obj(Vec::new()));
+    // Source artifact is always claude-shaped → read its `mcpServers`.
     let add_servers = match json_get(&add, "mcpServers") {
         Some(Json::Obj(e)) => e.clone(),
         _ => Vec::new(),
     };
-    // cur.mcpServers = Object.assign(cur.mcpServers || {}, reshape(add.mcpServers) || {})
-    if !matches!(json_get(&cur, "mcpServers"), Some(Json::Obj(_))) {
+    // cur[target_key] = Object.assign(cur[target_key] || {}, reshape(add.mcpServers) || {})
+    if !matches!(json_get(&cur, target_key), Some(Json::Obj(_))) {
         if let Json::Obj(top) = &mut cur {
-            json_upsert(top, "mcpServers", Json::Obj(Vec::new()));
+            json_upsert(top, target_key, Json::Obj(Vec::new()));
         }
     }
-    if let Some(Json::Obj(dst)) = json_get_mut(&mut cur, "mcpServers") {
+    if let Some(Json::Obj(dst)) = json_get_mut(&mut cur, target_key) {
         for (k, v) in add_servers {
             json_upsert(dst, &k, reshape(&v));
         }
@@ -1586,12 +1647,17 @@ fn merge_mcp_into(src: &Path, target: &Path, reshape: fn(&Json) -> Json) -> Resu
 /// wrote the facade endpoint into ~/.claude.json — the one file agy never reads — so an
 /// antigravity agent saw zero MCP tools even with the facade + octobroker correctly wired.
 /// How an MCP apply target writes the rendered artifact into its runtime config file.
-/// `JsonMcpServers` = merge the (reshaped) entries into the target JSON's `mcpServers` map
-/// (claude / antigravity today; cursor/kiro/devin/kimi are the same family — Phase 1b).
+/// `JsonMcpServers { key, reshape }` = merge the reshaped entries into the target JSON's `<key>`
+/// map. `key` is `mcpServers` for claude / antigravity / cursor / kiro / devin / kimi and `mcp`
+/// for opencode / mimo; `reshape` maps a claude-shaped rendered entry into the target runtime's
+/// entry shape (identity for claude, `to_antigravity_entry`, `to_opencode_entry`, …).
 /// `CodexToml` = reconstruct a codex `[mcp_servers.*]` managed block (TOML) from the
-/// claude-shaped runtime-mcp.json. (opencode/mimo's `mcp`-key JSON shape is the next variant.)
+/// claude-shaped runtime-mcp.json. (grok's TOML is the next variant — Phase 1b.)
 enum McpWriter {
-    JsonMcpServers(fn(&Json) -> Json),
+    JsonMcpServers {
+        key: &'static str,
+        reshape: fn(&Json) -> Json,
+    },
     CodexToml,
 }
 
@@ -1614,7 +1680,10 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "openab-agent-mcp.json",
             src: "openab-agent-mcp.json",
             target: home.join(".openab").join("agent").join("mcp.json"),
-            writer: McpWriter::JsonMcpServers(identity_entry),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: identity_entry,
+            },
             gate: None,
         },
         // claude endpoint ~/.claude.json — always (claude shape, no reshape).
@@ -1622,7 +1691,10 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "runtime-mcp.json",
             src: "runtime-mcp.json",
             target: home.join(".claude.json"),
-            writer: McpWriter::JsonMcpServers(identity_entry),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: identity_entry,
+            },
             gate: None,
         },
         // antigravity endpoint — agy reads ~/.gemini/config/mcp_config.json with a DIFFERENT
@@ -1632,7 +1704,10 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             label: "runtime-mcp.json(antigravity)",
             src: "runtime-mcp.json",
             target: home.join(".gemini").join("config").join("mcp_config.json"),
-            writer: McpWriter::JsonMcpServers(to_antigravity_entry),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcpServers",
+                reshape: to_antigravity_entry,
+            },
             gate: Some(home.join(".gemini")),
         },
         // codex endpoint — codex-acp reads ~/.codex/config.toml ([mcp_servers.*] TOML managed
@@ -1644,6 +1719,33 @@ fn mcp_apply_targets(home: &Path) -> Vec<McpApplyTarget> {
             target: home.join(".codex").join("config.toml"),
             writer: McpWriter::CodexToml,
             gate: Some(home.join(".codex")),
+        },
+        // opencode endpoint — opencode reads ~/.config/opencode/opencode.json with the `mcp` key
+        // and a DIFFERENT entry shape (`type:"remote"|"local"`, `enabled`, command-as-array,
+        // `environment`). Gated on ~/.config/opencode so a non-opencode pod is untouched.
+        McpApplyTarget {
+            label: "runtime-mcp.json(opencode)",
+            src: "runtime-mcp.json",
+            target: home.join(".config").join("opencode").join("opencode.json"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcp",
+                reshape: to_opencode_entry,
+            },
+            gate: Some(home.join(".config").join("opencode")),
+        },
+        // mimo endpoint — MiMo-Code is an opencode fork: same `mcp` key + entry shape, different
+        // config path (~/.config/mimocode/mimocode.jsonc). Gated on ~/.config/mimocode. (The file
+        // is .jsonc; if a pre-existing one carries comments they are dropped on the RMW, same as
+        // any bad-JSON target — acceptable since a pod file is capsync-managed.)
+        McpApplyTarget {
+            label: "runtime-mcp.json(mimo)",
+            src: "runtime-mcp.json",
+            target: home.join(".config").join("mimocode").join("mimocode.jsonc"),
+            writer: McpWriter::JsonMcpServers {
+                key: "mcp",
+                reshape: to_opencode_entry,
+            },
+            gate: Some(home.join(".config").join("mimocode")),
         },
     ]
 }
@@ -1657,8 +1759,8 @@ fn apply_mcp(from: &Path, home: &Path) -> Result<Vec<String>, String> {
             }
         }
         let wrote = match &t.writer {
-            McpWriter::JsonMcpServers(reshape) => {
-                merge_mcp_into(&from.join(t.src), &t.target, *reshape)?
+            McpWriter::JsonMcpServers { key, reshape } => {
+                merge_mcp_into(&from.join(t.src), &t.target, key, *reshape)?
             }
             McpWriter::CodexToml => apply_codex_mcp(&from.join(t.src), &t.target)?,
         };
