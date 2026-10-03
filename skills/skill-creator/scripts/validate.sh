@@ -103,8 +103,11 @@ validate_one() {
   else
     dlen=$(printf '%s' "$desc" | char_count)
     [ "$dlen" -le 1024 ] || e "description is $dlen chars (max 1024)"
+    case "$desc" in *TODO*) e "description still contains a TODO" ;; esac
+    # Claude platform rule: name/description cannot contain XML tags;
+    # Anthropic's validator rejects any '<' or '>' in the description.
     case "$desc" in
-      *TODO*|*\<*\>*) e "description still contains a TODO / <placeholder>" ;;
+      *[\<\>]*) e "description must not contain angle brackets '<' or '>' (XML tags / placeholders are rejected)" ;;
     esac
     [ "$dlen" -ge 40 ] || w "description is very short ($dlen chars) — say what it does AND when to use it"
   fi

@@ -13,7 +13,10 @@ Read when writing or changing a skill's frontmatter. Source of truth: <https://a
 | `metadata` | no | Map of string keys to string values for anything the spec doesn't define; use reasonably unique keys |
 | `allowed-tools` | no | Experimental; space-separated pre-approved tools (e.g. `Bash(git:*) Read`); support varies by runtime |
 
-Beyond the spec: some runtimes reject names containing the reserved words `claude` or `anthropic`; avoid them for portability.
+Beyond the spec, Claude's platform adds two rules ([Agent Skills overview](https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview#skill-structure)); follow them for portability:
+
+- `name` cannot contain the reserved words `anthropic` or `claude`.
+- `name` and `description` cannot contain XML tags — in practice, keep `<` and `>` out of the description entirely.
 
 ## Extra top-level keys
 
