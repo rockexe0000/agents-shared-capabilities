@@ -1,14 +1,13 @@
 #!/bin/sh
 # validate.sh — check a skill directory against the Agent Skills spec
-# (agentskills.io/specification) plus this catalog's conventions.
+# (agentskills.io/specification).
 #
 # Usage: validate.sh [--strict-spec] <skill-dir> [<skill-dir> ...]
 #
-#   --strict-spec  treat non-spec top-level frontmatter keys (including this
-#                  catalog's extension keys) as errors instead of warnings —
-#                  use when the skill must pass `skills-ref validate`.
+#   --strict-spec  treat non-spec top-level frontmatter keys as errors
+#                  instead of warnings (matches `skills-ref validate`).
 #
-# POSIX sh + awk only (no python/node): pods do not ship an interpreter.
+# POSIX sh + awk only, so it runs where no python/node is installed.
 # Exit 0 = no errors (warnings allowed), 1 = errors found, 2 = usage error.
 
 set -u
@@ -16,12 +15,11 @@ set -u
 strict=0
 case "${1:-}" in
   --strict-spec) strict=1; shift ;;
-  -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
 esac
 [ $# -ge 1 ] || { echo "usage: $0 [--strict-spec] <skill-dir> [...]" >&2; exit 2; }
 
 SPEC_KEYS=" name description license compatibility metadata allowed-tools "
-CATALOG_KEYS=" capability source pinned-ref checksum requires "
 
 total_err=0
 
@@ -74,17 +72,13 @@ validate_one() {
   esac
 
   # --- top-level keys ----------------------------------------------------
-  ext=""
+  extra=""
   for key in $(printf '%s\n' "$fm" | awk -F: '/^[A-Za-z0-9_-]+:/ { print $1 }'); do
     case "$SPEC_KEYS" in *" $key "*) continue ;; esac
-    case "$CATALOG_KEYS" in
-      *" $key "*) ext="$ext $key"; continue ;;
-    esac
-    msg="unknown top-level key '$key' (spec allows:$SPEC_KEYS)"
-    if [ "$strict" = 1 ]; then e "$msg"; else w "$msg"; fi
+    extra="$extra $key"
   done
-  if [ -n "$ext" ]; then
-    msg="catalog extension keys not in the Agent Skills spec:$ext (skills-ref validate rejects them)"
+  if [ -n "$extra" ]; then
+    msg="top-level keys not in the Agent Skills spec:$extra (skills-ref validate rejects them; move to metadata for portability)"
     if [ "$strict" = 1 ]; then e "$msg"; else w "$msg"; fi
   fi
 
