@@ -136,7 +136,7 @@ fn build_artifacts(
     cap_file: &Path,
     catalog: Option<&Path>,
     base: Option<&Path>,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let enable = parse_enable(cap_file);
     let perms_text = read_perms_beside(cap_file);
 
@@ -147,7 +147,7 @@ fn build_artifacts(
     let pipeline = pipeline_bin_arg(args);
     let bins = bin_list(&enable, &bin_tools, catalog, base, &pipeline);
 
-    let bundle = build_skills_bundle(&enable, catalog, base);
+    let bundle = build_skills_bundle(&enable, catalog, base)?;
     let authz = build_authz(&perms_text, &enable, catalog, base);
 
     let mut out: Vec<(String, String)> = vec![
@@ -164,7 +164,7 @@ fn build_artifacts(
         ));
     }
     out.push(("authz-suggest.txt".to_string(), suggest_text(&authz)));
-    out
+    Ok(out)
 }
 
 /// --render <outdir>: write every artifact off-pod (for infra to bake as a configMap).
@@ -175,7 +175,7 @@ fn render(args: &[String]) -> Result<(), String> {
     let cap_file = cap_file_from(args)?;
     let catalog = resolve_catalog(args);
     let base = personal_base(&cap_file);
-    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref());
+    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref())?;
 
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("mkdir {out_dir}: {e}"))?;
     let out = Path::new(&out_dir);
@@ -195,7 +195,7 @@ fn check(args: &[String]) -> Result<bool, String> {
     let cap_file = cap_file_from(args)?;
     let catalog = resolve_catalog(args);
     let base = personal_base(&cap_file);
-    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref());
+    let artifacts = build_artifacts(args, &cap_file, catalog.as_deref(), base.as_deref())?;
 
     let dir = Path::new(&dir);
     let mut drift = false;
@@ -2186,6 +2186,15 @@ fn apply_skills(from: &Path, home: &Path) -> Result<Vec<String>, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // A list naming skills with no tar to extract them from is a broken render (e.g. capsync
+    // ≤ v0.2.5 under busybox tar) — fail before touching the installed skills, rather than
+    // reporting them applied.
+    if b64_text.trim().is_empty() && !newnames.is_empty() {
+        return Err(format!(
+            "skills.list names {} skill(s) but skills.tar.b64 is empty — re-render",
+            newnames.len()
+        ));
+    }
     // GC previously-managed skills no longer enabled.
     if let Ok(prev) = std::fs::read_to_string(&mark) {
         for old in prev.lines().map(|l| l.trim()).filter(|l| !l.is_empty()) {
@@ -3556,7 +3565,8 @@ fn bin_install_tsv(tools: &[&BinTool]) -> String {
 
 // ============================================================================
 // skills axis (ADR 0008 Phase 1c) — port of sync.js buildSkillsBundle: stage the enabled
-// skills' dirs (each rooted at <name>/), tar deterministically via the same `tar`, base64.
+// skills' dirs (each rooted at <name>/), tar deterministically (native writer, byte-identical
+// to the GNU tar the node backend used), base64.
 // ============================================================================
 
 struct SkillsBundle {
@@ -3565,24 +3575,22 @@ struct SkillsBundle {
 }
 
 /// Port of buildSkillsBundle. skills sorted by name; each staged under <name>/ then tarred
-/// with GNU tar's determinism flags and base64'd (+ "\n"). skills.list = sorted names.
+/// deterministically (write_tar: byte-identical to the GNU tar determinism flags the node
+/// backend used) and base64'd (+ "\n"). skills.list = sorted names.
 /// Empty enable set -> both "" (matches node). Staging modes mirror node so tar bytes match:
 /// root 0700 (mkdtemp), dirs 0755 (mkdir default), files keep their source mode.
+///
+/// Err if a staged skill can't be tarred: skills.list must never name skills the tar lacks
+/// (the old shell-out to GNU-only `tar` flags failed silently under busybox → empty tar +
+/// non-empty list → apply reported skills it never extracted).
 fn build_skills_bundle(
     enable: &Enable,
     catalog: Option<&Path>,
     base: Option<&Path>,
-) -> SkillsBundle {
-    let empty = SkillsBundle {
-        tar_b64: String::new(),
-        list: String::new(),
-    };
+) -> Result<SkillsBundle, String> {
     let mut skills: Vec<&EnableSkill> = enable.skills.iter().collect();
     skills.sort_by(|a, b| a.name.cmp(&b.name)); // localeCompare ≈ scalar order for skill names
-    let staged = match make_stage_dir() {
-        Some(d) => d,
-        None => return empty,
-    };
+    let staged = make_stage_dir().ok_or("skills: mktemp failed")?;
     let mut names: Vec<String> = Vec::new();
     for s in skills {
         let dir = match (s.source.as_str(), base) {
@@ -3604,33 +3612,20 @@ fn build_skills_bundle(
             names.push(s.name.clone());
         }
     }
-    let tar_b64 = if names.is_empty() {
-        String::new()
+    let tar = if names.is_empty() {
+        Ok(Vec::new())
     } else {
-        match Command::new("tar")
-            .args([
-                "--sort=name",
-                "--mtime=UTC 2020-01-01",
-                "--owner=0",
-                "--group=0",
-                "--numeric-owner",
-                "-cf",
-                "-",
-                "-C",
-            ])
-            .arg(&staged)
-            .arg(".")
-            .output()
-        {
-            Ok(o) if o.status.success() => {
-                let mut s = base64_encode(&o.stdout);
-                s.push('\n');
-                s
-            }
-            _ => String::new(),
-        }
+        write_tar(&staged)
     };
     let _ = std::fs::remove_dir_all(&staged);
+    let tar = tar.map_err(|e| format!("skills: tar failed: {e}"))?;
+    let tar_b64 = if tar.is_empty() {
+        String::new()
+    } else {
+        let mut s = base64_encode(&tar);
+        s.push('\n');
+        s
+    };
     let list = if names.is_empty() {
         String::new()
     } else {
@@ -3638,7 +3633,114 @@ fn build_skills_bundle(
         s.push('\n');
         s
     };
-    SkillsBundle { tar_b64, list }
+    Ok(SkillsBundle { tar_b64, list })
+}
+
+/// Deterministic tar of `root` (rooted at `./`), byte-identical to
+/// `tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -cf - -C root .`
+/// (GNU tar, default gnu format). Native so render doesn't depend on the host `tar` — the
+/// cap-render init runs on alpine (busybox tar), which rejects those GNU-only flags.
+/// Dirs + regular files only (copy_tree already dereferences symlinks).
+fn write_tar(root: &Path) -> std::io::Result<Vec<u8>> {
+    const RECORD: usize = 10240; // GNU default blocking factor 20 × 512
+    let mut out = Vec::new();
+    tar_walk(root, ".", &mut out)?;
+    out.resize(out.len() + 1024, 0); // end-of-archive: two zero blocks
+    out.resize(out.len().div_ceil(RECORD) * RECORD, 0);
+    Ok(out)
+}
+
+fn tar_walk(dir: &Path, rel: &str, out: &mut Vec<u8>) -> std::io::Result<()> {
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    tar_entry(out, &format!("{rel}/"), mode, b'5', &[])?;
+    let mut names: Vec<std::ffi::OsString> = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    names.sort(); // byte order == GNU --sort=name
+    for n in names {
+        let name = n.to_str().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 file name")
+        })?;
+        let path = dir.join(&n);
+        let child = format!("{rel}/{name}");
+        let meta = std::fs::metadata(&path)?;
+        if meta.is_dir() {
+            tar_walk(&path, &child, out)?;
+        } else {
+            let data = std::fs::read(&path)?;
+            tar_entry(out, &child, meta.permissions().mode(), b'0', &data)?;
+        }
+    }
+    Ok(())
+}
+
+/// One gnu-format entry (header + data padded to 512). Names over 100 bytes get a GNU
+/// `././@LongLink` ('L') entry first, as GNU tar does.
+fn tar_entry(
+    out: &mut Vec<u8>,
+    name: &str,
+    mode: u32,
+    typeflag: u8,
+    data: &[u8],
+) -> std::io::Result<()> {
+    const MTIME: u64 = 1_577_836_800; // 2020-01-01T00:00:00Z
+    let name = name.as_bytes();
+    if name.len() > 100 {
+        let mut long = name.to_vec();
+        long.push(0);
+        tar_block(out, b"././@LongLink", 0o644, long.len() as u64, 0, b'L')?;
+        tar_data(out, &long);
+    }
+    tar_block(
+        out,
+        &name[..name.len().min(100)],
+        mode,
+        data.len() as u64,
+        MTIME,
+        typeflag,
+    )?;
+    tar_data(out, data);
+    Ok(())
+}
+
+fn tar_block(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    mode: u32,
+    size: u64,
+    mtime: u64,
+    typeflag: u8,
+) -> std::io::Result<()> {
+    fn octal(h: &mut [u8], at: usize, width: usize, v: u64) -> std::io::Result<()> {
+        let s = format!("{v:0w$o}", w = width - 1);
+        if s.len() != width - 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tar: value {v} overflows a {width}-byte field"),
+            ));
+        }
+        h[at..at + width - 1].copy_from_slice(s.as_bytes()); // trailing NUL already there
+        Ok(())
+    }
+    let mut h = [0u8; 512];
+    h[..name.len()].copy_from_slice(name);
+    octal(&mut h, 100, 8, u64::from(mode & 0o7777))?;
+    octal(&mut h, 108, 8, 0)?; // uid
+    octal(&mut h, 116, 8, 0)?; // gid
+    octal(&mut h, 124, 12, size)?;
+    octal(&mut h, 136, 12, mtime)?;
+    h[148..156].fill(b' '); // checksum is computed over spaces
+    h[156] = typeflag;
+    h[257..265].copy_from_slice(b"ustar  \0"); // gnu magic + version
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&h);
+    Ok(())
+}
+
+fn tar_data(out: &mut Vec<u8>, data: &[u8]) {
+    out.extend_from_slice(data);
+    out.resize(out.len().div_ceil(512) * 512, 0);
 }
 
 /// A fresh staging dir at mode 0700 (mkdtemp equivalent — tar records the `./` root with this
@@ -4545,6 +4647,59 @@ fn lint(args: &[String]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // write_tar must stay byte-identical to the GNU tar output committed as golden (the node
+    // backend's bytes) — without shelling out to tar. Modes set explicitly so umask can't skew.
+    #[test]
+    fn write_tar_matches_gnu_golden() {
+        let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = here.join("tests/fixtures/skills-multi/skills");
+        let staged = make_stage_dir().unwrap();
+        for s in ["a-skill", "b-skill"] {
+            copy_tree(&fixture.join(s), &staged.join(s)).unwrap();
+        }
+        for d in ["a-skill", "a-skill/reference", "b-skill"] {
+            std::fs::set_permissions(staged.join(d), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        for f in [
+            "a-skill/SKILL.md",
+            "a-skill/reference/notes.md",
+            "b-skill/SKILL.md",
+        ] {
+            std::fs::set_permissions(staged.join(f), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let tar = write_tar(&staged);
+        let _ = std::fs::remove_dir_all(&staged);
+        let golden =
+            std::fs::read_to_string(here.join("tests/golden/skills-multi/skills.tar.b64")).unwrap();
+        assert_eq!(base64_encode(&tar.unwrap()) + "\n", golden);
+    }
+
+    #[test]
+    fn tar_long_name_gets_gnu_longlink() {
+        let mut out = Vec::new();
+        let long = format!("./{}", "x".repeat(120));
+        tar_entry(&mut out, &long, 0o644, b'0', b"hi").unwrap();
+        assert_eq!(&out[..13], b"././@LongLink");
+        assert_eq!(out[156], b'L');
+        assert_eq!(&out[512..512 + long.len()], long.as_bytes());
+        assert_eq!(&out[1024..1124], &long.as_bytes()[..100]);
+        assert_eq!(out.len(), 512 * 4); // longlink hdr + name block + hdr + data block
+    }
+
+    #[test]
+    fn apply_skills_rejects_list_without_tar() {
+        let from = make_stage_dir().unwrap();
+        let home = make_stage_dir().unwrap();
+        std::fs::write(from.join("skills.tar.b64"), "").unwrap();
+        std::fs::write(from.join("skills.list"), "cfdrop\n").unwrap();
+        let res = apply_skills(&from, &home);
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(res.unwrap_err().contains("skills.tar.b64 is empty"));
+    }
 
     #[test]
     fn frontmatter_stripped_leading_only() {
