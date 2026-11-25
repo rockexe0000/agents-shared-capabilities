@@ -28,7 +28,7 @@ they consume**.
 | runs | dev box, manual / opt-in | pod `pre_boot`, automatic |
 | input | catalog + `capabilities.md` (live) | render artifacts (`~/.cap-render`) |
 | MCP data form | `ResolvedServer` (structured: transport/url/headers/command/env) | already-rendered **claude-shaped JSON** |
-| axes | skills · mcp · hooks (· bin with `--with-tools`) | authz · mcp · skills · bin (**no hooks yet**) |
+| axes | skills · mcp · hooks (· bin with `--with-tools`) | authz · claudeai-sync · mcp · skills · bin (**no hooks yet**) |
 | per-runtime gate | each projector checks the runtime is installed | `gate` = the runtime's base dir exists |
 
 ### The pipeline (the `render` step in the middle)
@@ -75,6 +75,7 @@ JSON reshape + a per-runtime gate.
 | **skills** | `skills.tar.b64`, `skills.list` | ✅ per-runtime | ✅ single dir | sync: claude/codex/antigravity/opencode |
 | **bin** | `bin-install.tsv` | ✅ `--with-tools` | ✅ | runtime-agnostic (`~/bin` on PATH) |
 | **hooks** | — (not rendered yet) | ✅ | — (Phase 4) | claude-code, antigravity |
+| **claudeai-sync** | `claudeai-sync.json` | — | ✅ | claude-code |
 
 Legend: ✅ implemented · — not on this path. Each axis's projector **gates on the runtime being
 present** (base dir exists) → a runtime absent from a pod is a no-op.
@@ -160,6 +161,28 @@ treats its skills dir as "installed" when its base dir exists.
 > ⚠️ **Known gaps (Phase 2):** `apply` skills is single-dir, not per-runtime like `sync`; and the
 > Codex skills path should be `~/.agents/skills` (official), not `~/.codex/skills`. Both are tracked
 > for the per-runtime skills pass.
+
+### claudeai-sync (claude.ai sync, default off)
+
+Claude Code signed in with a Claude account otherwise pulls the **skills, plugins, and MCP
+connectors enabled on claude.ai** into every session — capabilities that bypass the enable-list.
+This axis keeps them **default-off** like everything else, from `capabilities.md` `claudeai_sync:`
+(schema: [capabilities-schema](capabilities-schema.md)). **`apply`-only** (like authz; `sync`
+leaves a dev's own runtime alone). claude-code only — other runtimes have no claude.ai sync.
+
+| kind | owned key in `~/.claude/settings.json` | written when the kind is off (default) |
+|------|------------------------------------------|----------------------------------------|
+| `skills` | `syncClaudeAiSkills` | `false` |
+| `plugins` | `syncClaudeAiPlugins` | `false` |
+| `connectors` | `disableClaudeAiConnectors` | `true` |
+
+`claudeai-sync.json` carries the key of every kind **not** set to `"on"`. `apply` owns the three
+keys (RMW + `.bak`, every other setting preserved): a key in the artifact is set; a key absent from
+it (that kind is `"on"`) is **removed** — never written as the inverse, because Claude Code honors
+only `false` for the two sync keys and an any-source `true` for the connectors key. With sync off,
+Claude Code stops downloading and moves previously synced skills / plugins to
+`~/.claude/{skills,plugins}/.trash` at its next launch (re-enabling re-downloads, it does not
+restore).
 
 ### bin (ADR 0006)
 

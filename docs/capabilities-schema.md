@@ -47,6 +47,10 @@ mcp:
 hooks:
   - name: ""                # REQUIRED - hook name from hooks/registry.yaml (or personal)
     effect: "allow|deny"    # REQUIRED - allow = project + auto-run; deny = off. NO `ask` (see Rules / ADR 0005)
+claudeai_sync:
+  skills: "off|on"          # OPTIONAL - claude.ai skill sync (claude-code); omit = off
+  plugins: "off|on"         # OPTIONAL - claude.ai plugin sync (claude-code); omit = off
+  connectors: "off|on"      # OPTIONAL - claude.ai MCP connectors (claude-code); omit = off
 ```
 
 ## Rules
@@ -64,6 +68,11 @@ hooks:
   forward to this enable decision (verified-owner, via catalog PR review); default all-off. Each name
   resolves to a `hooks/registry.yaml` entry (canonical event + command); external hooks additionally need
   vendored + pinned + checksummed catalog entries.
+- **`claudeai_sync` keeps claude.ai sync default-off too.** A Claude Code runtime signed in with a
+  Claude account otherwise loads the skills, plugins, and MCP connectors enabled on claude.ai,
+  bypassing this enable-list. `capsync apply` keeps each kind off unless it is set to `"on"`
+  (claude-code only); the projected settings keys and why "on" removes a key instead of writing the
+  inverse: [runtime-projection](runtime-projection.md#claudeai-sync-claudeai-sync-default-off).
 - Enabling an **external** (third-party) skill/server is a permission-gated action — see
   `permissions.md` / Hot Permission Boundary; this file records the selection, not the approval.
 - Keep the concrete file at `personal/capabilities.md` (per-agent); keep this schema generic.

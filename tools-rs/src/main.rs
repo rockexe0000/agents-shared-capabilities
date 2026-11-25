@@ -11,6 +11,8 @@
 //!   - MCP (Phase 1a): openab-agent-mcp.json (facade) + runtime-mcp.json (direct).
 //!   - bin (Phase 1b): bin-install.tsv from enabled skills' `requires` (∪ --pipeline-bin).
 //!   - skills (Phase 1c): skills.tar.b64 (deterministic tar) + skills.list.
+//!   - claude.ai sync: claudeai-sync.json — the claude-code settings keys that keep claude.ai
+//!     skill / plugin / connector sync OFF unless capabilities.md `claudeai_sync:` turns it on.
 //!
 //! `--render` (write) and `--check` (re-render + diff committed, exit 1 on drift) are ported,
 //! plus `sync` live projection — SKILLS symlink (1e-1), MCP facade + direct for all four
@@ -164,6 +166,8 @@ fn build_artifacts(
         ));
     }
     out.push(("authz-suggest.txt".to_string(), suggest_text(&authz)));
+    let claudeai = claudeai_sync_json(&enable);
+    out.push(("claudeai-sync.json".to_string(), claudeai));
     Ok(out)
 }
 
@@ -1494,6 +1498,63 @@ fn apply_authz(from: &Path, home: &Path) -> Result<Vec<String>, String> {
     Ok(applied)
 }
 
+/// claude.ai sync kinds (`claudeai_sync:` in capabilities.md) → the claude-code settings key
+/// each one owns + the value that turns that sync OFF. Default all-off: a kind is synced only
+/// when capabilities.md sets it to "on". Claude Code honors only `false` for the two sync keys
+/// and an any-source `true` for the connectors key, so "on" is projected by REMOVING the key,
+/// never by writing the inverse value.
+const CLAUDEAI_SYNC: &[(&str, &str, bool)] = &[
+    ("skills", "syncClaudeAiSkills", false),
+    ("plugins", "syncClaudeAiPlugins", false),
+    ("connectors", "disableClaudeAiConnectors", true),
+];
+
+/// Render claudeai-sync.json: the owned settings key for every kind NOT turned on. A kind that
+/// is turned on is absent here, which `apply` turns into removing its key.
+fn claudeai_sync_json(enable: &Enable) -> String {
+    let mut entries: Vec<(String, Json)> = Vec::new();
+    for &(kind, key, off) in CLAUDEAI_SYNC {
+        if !enable.claudeai_on.iter().any(|k| k == kind) {
+            entries.push((key.to_string(), Json::Bool(off)));
+        }
+    }
+    let mut out = stringify(&Json::Obj(entries), 0);
+    out.push('\n');
+    out
+}
+
+/// Apply claudeai-sync.json into ~/.claude/settings.json (claude-code only). capsync OWNS the
+/// CLAUDEAI_SYNC keys: one present in the artifact is set to its value; one absent from it (that
+/// kind is turned on) is REMOVED. Every other setting is preserved (RMW + .bak). Skipped when
+/// claude-code is absent or the render dir has no artifact.
+fn apply_claudeai_sync(from: &Path, home: &Path) -> Result<Vec<String>, String> {
+    if !home.join(".claude").exists() {
+        return Ok(Vec::new()); // claude-code not present on this pod
+    }
+    let file = from.join("claudeai-sync.json");
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Ok(Vec::new()); // no claudeai-sync artifact in the render dir
+    };
+    let bad = || format!("apply: invalid JSON in {}", file.display());
+    let managed = parse_json(&text).map_err(|_| bad())?;
+    let settings = home.join(".claude").join("settings.json");
+    let (mut cfg, _) = json_read_for_rmw(&settings)?; // writes .bak; returns Obj
+    let mut applied = Vec::new();
+    if let Json::Obj(top) = &mut cfg {
+        for &(kind, key, _) in CLAUDEAI_SYNC {
+            if let Some(Json::Bool(v)) = json_get(&managed, key) {
+                json_upsert(top, key, Json::Bool(*v));
+                applied.push(format!("{kind}=off"));
+            } else {
+                top.retain(|(k, _)| k != key);
+                applied.push(format!("{kind}=on"));
+            }
+        }
+    }
+    json_write_pretty(&settings, &cfg)?;
+    Ok(applied)
+}
+
 /// Reshape identity — claude-shaped targets (~/.claude.json, the facade sources file) store
 /// each rendered MCP entry verbatim.
 fn identity_entry(e: &Json) -> Json {
@@ -2233,8 +2294,8 @@ fn apply_skills(from: &Path, home: &Path) -> Result<Vec<String>, String> {
 }
 
 /// `capsync apply [--from <dir>]`: apply the SELF-CONTAINED render artifacts (default
-/// $HOME/.cap-render) into HOME — mcp, bin, skills, authz — replacing the pod's node/sh
-/// appliers. Each axis self-scopes (missing artifact / absent runtime → skip).
+/// $HOME/.cap-render) into HOME — mcp, bin, skills, authz, claudeai-sync — replacing the
+/// pod's node/sh appliers. Each axis self-scopes (missing artifact / absent runtime → skip).
 fn apply_cmd(args: &[String]) -> Result<(), String> {
     let home = PathBuf::from(std::env::var("HOME").map_err(|_| "HOME not set".to_string())?);
     let from = flag_value(args, "--from")
@@ -2264,6 +2325,7 @@ fn apply_cmd(args: &[String]) -> Result<(), String> {
         }
     };
     run("authz", apply_authz(&from, &home));
+    run("claudeai-sync", apply_claudeai_sync(&from, &home));
     run("mcp", apply_mcp(&from, &home));
     run("skills", apply_skills(&from, &home));
     run("bin", apply_bin(&from, &home));
@@ -2704,6 +2766,7 @@ struct Enable {
     skills: Vec<EnableSkill>,
     mcp: Vec<EnableMcp>,
     hooks: Vec<EnableHook>,
+    claudeai_on: Vec<String>, // claude.ai sync kinds turned "on" (default all-off)
 }
 struct EnableSkill {
     name: String,
@@ -2756,6 +2819,11 @@ fn parse_enable(file: &Path) -> Enable {
                     if let Some(name) = match_dash_name(raw) {
                         out.mcp.push(EnableMcp { name });
                     }
+                }
+            }
+            Some("claudeai_sync") => {
+                if let Some(kind) = match_claudeai_on(raw) {
+                    out.claudeai_on.push(kind);
                 }
             }
             Some("hooks") => {
@@ -2845,6 +2913,19 @@ fn match_skill_name(raw: &str) -> Option<String> {
         None
     } else {
         Some(v)
+    }
+}
+
+/// `claudeai_sync:` child line `  <kind>: "on"` → the kind it turns on. Known kinds only; any
+/// other value (e.g. "off") leaves the default off.
+fn match_claudeai_on(raw: &str) -> Option<String> {
+    let (key, val) = raw.trim().split_once(':')?;
+    let key = key.trim();
+    let known = CLAUDEAI_SYNC.iter().any(|&(kind, _, _)| kind == key);
+    if known && strip(val) == "on" {
+        Some(key.to_string())
+    } else {
+        None
     }
 }
 
@@ -4647,6 +4728,57 @@ fn lint(args: &[String]) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // claudeai_sync: default all-off; "on" drops that kind's key from the artifact.
+    #[test]
+    fn claudeai_sync_defaults_off_and_on_drops_the_key() {
+        let dir = make_stage_dir().unwrap();
+        let cap = dir.join("capabilities.md");
+        let body = "skills:\nclaudeai_sync:\n  skills: \"on\"  # keep\n  connectors: off\n";
+        std::fs::write(&cap, body).unwrap();
+        let enable = parse_enable(&cap);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(enable.claudeai_on, vec!["skills".to_string()]);
+        let got = claudeai_sync_json(&enable);
+        assert!(!got.contains("syncClaudeAiSkills"));
+        assert!(got.contains("\"syncClaudeAiPlugins\": false"));
+        assert!(got.contains("\"disableClaudeAiConnectors\": true"));
+        let all_off = claudeai_sync_json(&Enable::default());
+        assert!(all_off.contains("\"syncClaudeAiSkills\": false"));
+    }
+
+    // apply owns the three keys: present → set, absent → removed; other keys are kept.
+    #[test]
+    fn apply_claudeai_sync_sets_owned_keys_and_keeps_others() {
+        let from = make_stage_dir().unwrap();
+        let home = make_stage_dir().unwrap();
+        let artifact = "{\n  \"syncClaudeAiPlugins\": false\n}\n";
+        std::fs::write(from.join("claudeai-sync.json"), artifact).unwrap();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        let seeded = "{\n  \"model\": \"keep-me\",\n  \"syncClaudeAiSkills\": false\n}\n";
+        let settings = home.join(".claude").join("settings.json");
+        std::fs::write(&settings, seeded).unwrap();
+        let res = apply_claudeai_sync(&from, &home);
+        let got = std::fs::read_to_string(&settings).unwrap();
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(res.is_ok());
+        let want = "{\n  \"model\": \"keep-me\",\n  \"syncClaudeAiPlugins\": false\n}\n";
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn apply_claudeai_sync_skips_without_claude_dir() {
+        let from = make_stage_dir().unwrap();
+        let home = make_stage_dir().unwrap();
+        std::fs::write(from.join("claudeai-sync.json"), "{}\n").unwrap();
+        let res = apply_claudeai_sync(&from, &home);
+        let created = home.join(".claude").exists();
+        let _ = std::fs::remove_dir_all(&from);
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(res.unwrap().is_empty());
+        assert!(!created);
+    }
 
     // write_tar must stay byte-identical to the GNU tar output committed as golden (the node
     // backend's bytes) — without shelling out to tar. Modes set explicitly so umask can't skew.
