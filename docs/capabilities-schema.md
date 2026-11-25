@@ -71,7 +71,9 @@ claudeai_sync:
 - **`claudeai_sync` keeps claude.ai sync default-off too.** A Claude Code runtime signed in with a
   Claude account otherwise loads the skills, plugins, and MCP connectors enabled on claude.ai,
   bypassing this enable-list. `capsync apply` keeps each kind off unless it is set to `"on"`
-  (claude-code only); the projected settings keys and why "on" removes a key instead of writing the
+  (claude-code only). Block form only (one `<kind>: "on"|"off"` per indented line); any other line
+  under `claudeai_sync:` (unknown kind, `ON`, `true`, the inline `{…}` form) is ignored with a
+  render warning and that kind stays off; the projected settings keys and why "on" removes a key instead of writing the
   inverse: [runtime-projection](runtime-projection.md#claudeai-sync-claudeai-sync-default-off).
 - Enabling an **external** (third-party) skill/server is a permission-gated action — see
   `permissions.md` / Hot Permission Boundary; this file records the selection, not the approval.

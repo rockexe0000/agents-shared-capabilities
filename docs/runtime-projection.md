@@ -177,12 +177,32 @@ leaves a dev's own runtime alone). claude-code only — other runtimes have no c
 | `connectors` | `disableClaudeAiConnectors` | `true` |
 
 `claudeai-sync.json` carries the key of every kind **not** set to `"on"`. `apply` owns the three
-keys (RMW + `.bak`, every other setting preserved): a key in the artifact is set; a key absent from
-it (that kind is `"on"`) is **removed** — never written as the inverse, because Claude Code honors
-only `false` for the two sync keys and an any-source `true` for the connectors key. With sync off,
-Claude Code stops downloading and moves previously synced skills / plugins to
-`~/.claude/{skills,plugins}/.trash` at its next launch (re-enabling re-downloads, it does not
-restore).
+keys: a key in the artifact is set; a key absent from it (that kind is `"on"`) is **removed**. Every
+other setting is preserved; an unchanged file is not rewritten. Settings semantics, per the
+official [settings reference](https://code.claude.com/docs/en/settings-reference) and
+[MCP docs](https://code.claude.com/docs/en/mcp) (checked 2026-11-25):
+
+- **Why remove, not invert.** Claude Code honors only `false` for the two sync keys (`true` is the
+  same as unset), and `disableClaudeAiConnectors` is any-source-true (a `false` elsewhere cannot
+  turn connectors back on).
+- **Why user settings.** A sync-key `false` is honored from user, local, managed, or `--settings`
+  — but **ignored** in a project `.claude/settings.json`, so never move these keys into a repo.
+- **Versions / coverage.** `syncClaudeAiPlugins` needs Claude Code **v2.1.273+** (older versions
+  ignore it). `disableClaudeAiConnectors` covers connectors Claude Code fetches itself (terminal,
+  IDE, Agent SDK sessions) — not the desktop app or cloud sessions.
+- **Effect.** With sync off Claude Code stops downloading and moves previously synced skills /
+  plugins to `~/.claude/{skills,plugins}/.trash` at its next launch; re-enabling re-downloads, it
+  does not restore.
+- **Fresh pod.** Gated on `~/.claude` existing (like every axis): if it does not exist yet at boot
+  (e.g. before the first `claude` login on a new volume), nothing is written until the next
+  `apply`, so the first session after that login may still sync once.
+- **Backups.** authz and claudeai-sync both RMW `~/.claude/settings.json`; `.bak` is written once
+  per run, so it keeps the pre-run original.
+- **Finer grain is out of scope.** `skillOverrides` (per skill; the docs do not say it covers
+  claude.ai-synced skills), `enabledPlugins` `"<name>@synced": false` (per plugin), and
+  `deniedMcpServers` (per connector, e.g. `claude.ai Slack`) are deny-lists: new claude.ai items
+  would still appear by default. In the enable-list model, a wanted claude.ai skill is vendored into
+  the catalog instead, or its whole kind is turned `"on"` for that agent.
 
 ### bin (ADR 0006)
 
