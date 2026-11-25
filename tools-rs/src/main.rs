@@ -1532,7 +1532,7 @@ const CLAUDEAI_SYNC: &[(&str, &str, bool)] = &[
 ];
 
 /// Shown for a `claudeai_sync:` line the parser ignored (that kind stays off).
-const CLAUDEAI_HINT: &str = "want `<skills|plugins|connectors>: \"on\"|\"off\"` (block form)";
+const CLAUDEAI_HINT: &str = "want a bare `claudeai_sync:` line, then `<kind>: \"on\"|\"off\"` lines";
 
 /// Render claudeai-sync.json: the owned settings key for every kind NOT turned on. A kind that
 /// is turned on is absent here, which `apply` turns into removing its key.

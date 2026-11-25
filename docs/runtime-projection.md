@@ -198,11 +198,13 @@ official [settings reference](https://code.claude.com/docs/en/settings-reference
   `apply`, so the first session after that login may still sync once.
 - **Backups.** authz and claudeai-sync both RMW `~/.claude/settings.json`; `.bak` is written once
   per run, so it keeps the pre-run original.
-- **Finer grain is out of scope.** `skillOverrides` (per skill; the docs do not say it covers
-  claude.ai-synced skills), `enabledPlugins` `"<name>@synced": false` (per plugin), and
-  `deniedMcpServers` (per connector, e.g. `claude.ai Slack`) are deny-lists: new claude.ai items
-  would still appear by default. In the enable-list model, a wanted claude.ai skill is vendored into
-  the catalog instead, or its whole kind is turned `"on"` for that agent.
+- **Finer grain is out of scope.** Skills and plugins have only deny-lists — `skillOverrides` (per
+  skill; the docs do not say it covers claude.ai-synced skills) and `enabledPlugins`
+  `"<name>@synced": false` — so new claude.ai items would still appear by default; a wanted
+  claude.ai skill is vendored into the catalog instead. Connectors could use the
+  `allowedMcpServers` allowlist, but it gates every MCP server, so it would also have to list the
+  local ones (e.g. `oab-facade`) — not done here. Otherwise a whole kind is turned `"on"` for one
+  agent (`skills: "on"` brings in every skill enabled on the account).
 
 ### bin (ADR 0006)
 
