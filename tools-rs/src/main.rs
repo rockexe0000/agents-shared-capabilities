@@ -2795,7 +2795,7 @@ struct Enable {
     skills: Vec<EnableSkill>,
     mcp: Vec<EnableMcp>,
     hooks: Vec<EnableHook>,
-    claudeai_on: Vec<String>,  // claude.ai sync kinds turned "on" (default all-off)
+    claudeai_on: Vec<String>, // claude.ai sync kinds turned "on" (default all-off)
     claudeai_bad: Vec<String>, // claudeai_sync lines the parser ignored (→ render warning)
 }
 struct EnableSkill {
