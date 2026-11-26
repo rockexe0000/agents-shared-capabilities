@@ -13,7 +13,7 @@
 # `apply`) in isolated $HOMEs and asserts capsync's behaviour directly.
 #
 # Compared files: authz-*.json + authz-suggest.txt + openab-agent-mcp.json / runtime-mcp.json
-# + bin-install.tsv + skills.tar.b64 / skills.list.
+# + bin-install.tsv + skills.tar.b64 / skills.list + claudeai-sync.json.
 #
 # Modes:
 #   (default)        build + run capsync; diff render vs golden + run the stateful assertions.
@@ -29,7 +29,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 FIXTURES="$HERE/tests/fixtures"
 GOLDEN="$HERE/tests/golden"
-FILES=(authz-antigravity.json authz-claude-code.json authz-suggest.txt bin-install.tsv openab-agent-mcp.json runtime-mcp.json skills.list skills.tar.b64)
+FILES=(authz-antigravity.json authz-claude-code.json authz-suggest.txt bin-install.tsv claudeai-sync.json openab-agent-mcp.json runtime-mcp.json skills.list skills.tar.b64)
 
 MODE="full"
 case "${1:-}" in
@@ -317,6 +317,24 @@ if ! grep -q '"keep-me"' "$ahr/.claude/settings.json" || ! grep -q '"Bash(cfdrop
   echo "APPLY authz: didn't merge as expected:"; cat "$ahr/.claude/settings.json"; fail=1
 fi
 echo "ok: apply (authz)"
+
+# ---- apply claudeai-sync (claude.ai skill / plugin / connector sync, default off) ----
+# capsync OWNS the three keys: present in the artifact → set; absent (that kind turned on) →
+# removed; every other key kept. No ~/.claude → no-op (must not create it).
+csdir="$tmp/apply_claudeai"; mkdir -p "$csdir"
+printf '{\n  "syncClaudeAiPlugins": false,\n  "disableClaudeAiConnectors": true\n}\n' \
+  > "$csdir/claudeai-sync.json"
+cshome="$tmp/applyhome_cs"; mkdir -p "$cshome/.claude"
+printf '{\n  "model": "keep-me",\n  "syncClaudeAiSkills": false\n}\n' > "$cshome/.claude/settings.json"
+HOME="$cshome" "$RUST_BIN" apply --from "$csdir" >/dev/null 2>&1 || { echo "APPLY claudeai-sync: rust apply errored"; fail=1; }
+cswant="$(printf '{\n  "model": "keep-me",\n  "syncClaudeAiPlugins": false,\n  "disableClaudeAiConnectors": true\n}')"
+if [ "$(cat "$cshome/.claude/settings.json")" != "$cswant" ]; then
+  echo "APPLY claudeai-sync: unexpected settings.json:"; cat "$cshome/.claude/settings.json"; fail=1
+fi
+csnone="$tmp/applyhome_cs_none"; mkdir -p "$csnone"
+HOME="$csnone" "$RUST_BIN" apply --from "$csdir" >/dev/null 2>&1 || true
+[ ! -e "$csnone/.claude" ] || { echo "APPLY claudeai-sync: created ~/.claude without claude-code"; fail=1; }
+echo "ok: apply (claudeai-sync)"
 
 # ---- apply mcp (ADR 0008 Phase 4) ----
 # Rendered facade + direct MCP artifacts merged into pre-existing targets (unrelated key kept +

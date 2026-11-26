@@ -14,10 +14,10 @@ produced, frozen into the committed golden) via a hand-rolled serializer:
 
 | command | what it does |
 |---------|--------------|
-| `--render <dir> [--capabilities <f>] [--catalog <d>]` | write every artifact off-pod: `authz-*.json` + `authz-suggest.txt`, `openab-agent-mcp.json` (facade) + `runtime-mcp.json` (direct), `bin-install.tsv`, `skills.tar.b64` + `skills.list` |
+| `--render <dir> [--capabilities <f>] [--catalog <d>]` | write every artifact off-pod: `authz-*.json` + `authz-suggest.txt`, `openab-agent-mcp.json` (facade) + `runtime-mcp.json` (direct), `bin-install.tsv`, `skills.tar.b64` + `skills.list`, `claudeai-sync.json` |
 | `--check <dir> …` | re-render + diff committed artifacts; exit 1 on drift |
 | `sync [--with-tools] [--catalog <d>]` | **off-pod** live projection into `$HOME`: skills symlinks, MCP merge into each runtime config (claude-code/codex/antigravity/opencode + oab-facade), hooks (claude/antigravity); `--with-tools` also fetches+verifies the pinned bin CLIs enabled skills `require` |
-| `apply --from <dir>` | **on-pod** projection from the render artifacts (ADR 0008 Phase 4, runs in `pre_boot`): authz merge, MCP reshaped into each **present** runtime (claude / antigravity / codex / opencode / mimo — gated per runtime, absent = no-op), bin install, skills extract. Per-runtime MCP shapes + the DRY target registry: [`docs/runtime-projection.md`](../docs/runtime-projection.md) |
+| `apply --from <dir>` | **on-pod** projection from the render artifacts (ADR 0008 Phase 4, runs in `pre_boot`): authz merge, claude.ai sync keys (claude-code `settings.json`, default off), MCP reshaped into each **present** runtime (claude / antigravity / codex / opencode / mimo — gated per runtime, absent = no-op), bin install, skills extract. Per-runtime MCP shapes + the DRY target registry: [`docs/runtime-projection.md`](../docs/runtime-projection.md) |
 | `--check-tools …` | verify installed bin tools vs the registry (drift → exit 1); no network |
 | `lint [--catalog <d>]` | validate the catalog (bin/skills/mcp/hooks registries: naming, uniqueness, secret hygiene, supply-chain pins, `requires` floors); errors → exit 1 |
 

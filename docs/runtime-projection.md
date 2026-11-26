@@ -28,7 +28,7 @@ they consume**.
 | runs | dev box, manual / opt-in | pod `pre_boot`, automatic |
 | input | catalog + `capabilities.md` (live) | render artifacts (`~/.cap-render`) |
 | MCP data form | `ResolvedServer` (structured: transport/url/headers/command/env) | already-rendered **claude-shaped JSON** |
-| axes | skills · mcp · hooks (· bin with `--with-tools`) | authz · mcp · skills · bin (**no hooks yet**) |
+| axes | skills · mcp · hooks (· bin with `--with-tools`) | authz · claudeai-sync · mcp · skills · bin (**no hooks yet**) |
 | per-runtime gate | each projector checks the runtime is installed | `gate` = the runtime's base dir exists |
 
 ### The pipeline (the `render` step in the middle)
@@ -75,6 +75,7 @@ JSON reshape + a per-runtime gate.
 | **skills** | `skills.tar.b64`, `skills.list` | ✅ per-runtime | ✅ single dir | sync: claude/codex/antigravity/opencode |
 | **bin** | `bin-install.tsv` | ✅ `--with-tools` | ✅ | runtime-agnostic (`~/bin` on PATH) |
 | **hooks** | — (not rendered yet) | ✅ | — (Phase 4) | claude-code, antigravity |
+| **claudeai-sync** | `claudeai-sync.json` | — | ✅ | claude-code |
 
 Legend: ✅ implemented · — not on this path. Each axis's projector **gates on the runtime being
 present** (base dir exists) → a runtime absent from a pod is a no-op.
@@ -160,6 +161,50 @@ treats its skills dir as "installed" when its base dir exists.
 > ⚠️ **Known gaps (Phase 2):** `apply` skills is single-dir, not per-runtime like `sync`; and the
 > Codex skills path should be `~/.agents/skills` (official), not `~/.codex/skills`. Both are tracked
 > for the per-runtime skills pass.
+
+### claudeai-sync (claude.ai sync, default off)
+
+Claude Code signed in with a Claude account otherwise pulls the **skills, plugins, and MCP
+connectors enabled on claude.ai** into every session — capabilities that bypass the enable-list.
+This axis keeps them **default-off** like everything else, from `capabilities.md` `claudeai_sync:`
+(schema: [capabilities-schema](capabilities-schema.md)). **`apply`-only** (like authz; `sync`
+leaves a dev's own runtime alone). claude-code only — other runtimes have no claude.ai sync.
+
+| kind | owned key in `~/.claude/settings.json` | written when the kind is off (default) |
+|------|------------------------------------------|----------------------------------------|
+| `skills` | `syncClaudeAiSkills` | `false` |
+| `plugins` | `syncClaudeAiPlugins` | `false` |
+| `connectors` | `disableClaudeAiConnectors` | `true` |
+
+`claudeai-sync.json` carries the key of every kind **not** set to `"on"`. `apply` owns the three
+keys: a key in the artifact is set; a key absent from it (that kind is `"on"`) is **removed**. Every
+other setting is preserved; an unchanged file is not rewritten. Settings semantics, per the
+official [settings reference](https://code.claude.com/docs/en/settings-reference) and
+[MCP docs](https://code.claude.com/docs/en/mcp) (checked 2026-11-25):
+
+- **Why remove, not invert.** Claude Code honors only `false` for the two sync keys (`true` is the
+  same as unset), and `disableClaudeAiConnectors` is any-source-true (a `false` elsewhere cannot
+  turn connectors back on).
+- **Why user settings.** A sync-key `false` is honored from user, local, managed, or `--settings`
+  — but **ignored** in a project `.claude/settings.json`, so never move these keys into a repo.
+- **Versions / coverage.** `syncClaudeAiPlugins` needs Claude Code **v2.1.273+** (older versions
+  ignore it). `disableClaudeAiConnectors` covers connectors Claude Code fetches itself (terminal,
+  IDE, Agent SDK sessions) — not the desktop app or cloud sessions.
+- **Effect.** With sync off Claude Code stops downloading and moves previously synced skills /
+  plugins to `~/.claude/{skills,plugins}/.trash` at its next launch; re-enabling re-downloads, it
+  does not restore.
+- **Fresh pod.** Gated on `~/.claude` existing (like every axis): if it does not exist yet at boot
+  (e.g. before the first `claude` login on a new volume), nothing is written until the next
+  `apply`, so the first session after that login may still sync once.
+- **Backups.** authz and claudeai-sync both RMW `~/.claude/settings.json`; `.bak` is written once
+  per run, so it keeps the pre-run original.
+- **Finer grain is out of scope.** Skills and plugins have only deny-lists — `skillOverrides` (per
+  skill; the docs do not say it covers claude.ai-synced skills) and `enabledPlugins`
+  `"<name>@synced": false` — so new claude.ai items would still appear by default; a wanted
+  claude.ai skill is vendored into the catalog instead. Connectors could use the
+  `allowedMcpServers` allowlist, but it gates every MCP server, so it would also have to list the
+  local ones (e.g. `oab-facade`) — not done here. Otherwise a whole kind is turned `"on"` for one
+  agent (`skills: "on"` brings in every skill enabled on the account).
 
 ### bin (ADR 0006)
 
